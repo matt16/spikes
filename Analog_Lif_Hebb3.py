@@ -449,6 +449,7 @@ if __name__ == "__main__":
 
 
     # ---- Test loop ----
+    # Does it really work?
     y_true_test, y_pred_test = [], []
     for b in range(B):
         trial_out = model.run_trial(x[b], y[b])

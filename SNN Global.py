@@ -188,6 +188,7 @@ class LatencyEncoder:
 # ---------------------------- Network (global time) ----------------------------
 class DeepCausalSNN_Event:
     def __init__(self, n_in: int, n_h1: int, n_h2: int, n_out: int, params: dict):
+
         # Populations
         self.h1 = LIFPopulation(n_h1, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.1), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h1')
         self.h2 = LIFPopulation(n_h2, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.1), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h2')
@@ -210,6 +211,10 @@ class DeepCausalSNN_Event:
         self.sample_window = float(params.get('encoding_window', 20.0))
         self.silent_gap = float(params.get('silent_gap', 0.0))  # idle time between samples
 
+        #avg losses
+        self.avg_latency_loss_per_epoch = []
+        self._epoch_losses = []
+
     def epoch_reset(self):
         """Reset all time-dependent variables at epoch start; keep weights."""
         self.t_global = 0.0
@@ -217,6 +222,27 @@ class DeepCausalSNN_Event:
         [pop.reset() for pop in [self.h1, self.h2, self.out]]
         # Reset synapse traces
         [syn.reset() for syn in [self.in_h1, self.h1_rec, self.h1_h2, self.h2_rec, self.syn_h2out]]
+
+
+    # === LOSS TRACKING HELPERS: BEGIN ==============================  # <<< ADD
+    def _log_sample_latency_loss(self, loss_value: float):
+        """Pro-Sample-Loss einer laufenden Epoche registrieren."""
+        self._epoch_losses.append(float(loss_value))
+
+    def _start_new_epoch(self):
+        """Am Anfang einer Epoche aufrufen."""
+        self._epoch_losses = []
+
+    def _finish_epoch_and_store_avg(self):
+        """Am Ende einer Epoche den Durchschnitt berechnen und sichern."""
+        if len(self._epoch_losses) == 0:
+            self.avg_latency_loss_per_epoch.append(float("nan"))
+        else:
+            self.avg_latency_loss_per_epoch.append(
+                sum(self._epoch_losses) / len(self._epoch_losses)
+            )
+
+
 
     # ---- core: process a stream of samples sequentially on the global clock ----
     def run_stream(self, x_batch, y_batch, encoding_window=5.0, d_ax=0.5):
@@ -305,11 +331,16 @@ class DeepCausalSNN_Event:
             if sample_idx in pending_out and sample_idx in pending_tgt:
                 t_out = pending_out[sample_idx]
                 t_tgt = pending_tgt[sample_idx]
+                latency_loss = (t_out - t_tgt) ** 2
+                model._log_sample_latency_loss(latency_loss)  # <<< ADD (pro Sample)
                 loss.append((self.t_global, (t_out - t_tgt) ** 2))
                 del pending_out[sample_idx]
                 del pending_tgt[sample_idx]
 
         return spikes, loss
+
+
+
 
 
 # ---------------------------- Main ----------------------------
@@ -332,10 +363,15 @@ if __name__ == "__main__":
     all_losses = []
     model = DeepCausalSNN_Event(N_IN, params["n_h1"], params["n_h2"], N_OUT, params)
     for epoch in range(n_epochs):
+        model._start_new_epoch()  # <<< ADD (Epoch-Start)
         model.epoch_reset()
         spikes, loss = model.run_stream(x, y, t_max_per_sample, d_ax=0.05)
         times, losses = zip(*loss) if loss else ([], [])
         all_losses.append((epoch, times, losses))
+        model._finish_epoch_and_store_avg()  # <<< ADD (Epoch-Ende, VOR Reset)
+
+
+
 
 
     # ---------------------------- Raster Plot with Sample Boundaries ----------------------------
@@ -375,4 +411,26 @@ if __name__ == "__main__":
         plt.show()
 
     plot_spikes_raster(spikes, t_max_per_sample, B)
+
+
+    # ---------------------------- Plot: AVG Latency Loss per Training Epoch ----------------------------
+
+    def plot_avg_latency_loss(model):
+        """Verlauf des durchschnittlichen Latency Loss pro Epoche plotten."""
+        if len(model.avg_latency_loss_per_epoch) == 0:
+            print("Keine Daten in avg_latency_loss_per_epoch.")
+            return
+        epochs = range(1, len(model.avg_latency_loss_per_epoch) + 1)
+        plt.figure(figsize=(8, 5))
+        plt.plot(epochs, model.avg_latency_loss_per_epoch, marker='o', linestyle='-')
+        plt.xlabel("Epoch")
+        plt.ylabel("Durchschnittlicher Latency Loss")
+        plt.title("Verlauf des durchschnittlichen Latency Loss pro Epoche")
+        plt.grid(True)
+        plt.show()
+
+
+    plot_avg_latency_loss(model)  # wenn deine Instanz 'net' heißt
+
+
 

@@ -124,6 +124,11 @@ class SynapseMatrix:
         self.A_plus, self.A_minus, self.alpha = float(A_plus), float(A_minus), float(alpha)
         self.w_clip = w_clip
 
+        # additional parameter for reward based update
+        self.reward_mod = False  # default off
+        self.reward_min = 0.1   # set barriers for stabilization
+        self.reward_max = 1.5
+        self.reward_factor = 1.0
 
     def decay_to(self, t: float):
         self.pre_trace.decay_to(t)
@@ -143,9 +148,12 @@ class SynapseMatrix:
     def on_post_spike(self, j: int, t: float):
         self.decay_to(t)
         self.post_trace.add(j, 1.0)
+        #
+        reward_factor = (self.reward_factor if self.reward_mod else 1.0)
         if self.learn:
             x = self.pre_trace.val
-            self.W[:, j] += -self.A_minus * x - self.alpha * (self.post_trace.val[j] ** 2) * self.W[:, j]
+            print(reward_factor)
+            self.W[:, j] += -self.A_minus * x * reward_factor - self.alpha * (self.post_trace.val[j] ** 2) * self.W[:, j]
             # TODO: this is equal to self.W[:, j] += -self.A_minus * x - self.alpha * (1**2) * self.W[:, j]
             np.clip(self.W[:, j], self.w_clip[0], self.w_clip[1], out=self.W[:, j])
 
@@ -154,6 +162,14 @@ class SynapseMatrix:
         self.pre_trace.t_last = 0.0
         self.post_trace.val[:] = 0.0
         self.post_trace.t_last = 0.0
+
+    # reward
+    def set_reward(self, r: float):
+        """Setzt den Reward-Faktor; wirksam nur, wenn reward_mod=True."""
+        r = float(r)
+        if not np.isfinite(r):
+            r = 1.0
+        self.reward_factor = float(np.clip(r, self.reward_min, self.reward_max))
 
 
 # ---------------------------- Latency (time-to-first-spike) Encoder ----------------------------
@@ -192,6 +208,12 @@ class DeepCausalSNN_Event:
 
         #TODO: include reward function
         self.syn_h2out = SynapseMatrix(n_h2, n_out, **params.get('syn_rec2', {}), name='h2->out')
+
+
+        #reward function
+        self.syn_h2out.reward_mod = True
+        self.syn_h2out.reward_min = 0.1
+        self.syn_h2out.reward_max = 1.5
 
         # Encoders
         self.enc_in  = LatencyEncoder(window=params['encoding_window'])
@@ -292,10 +314,10 @@ class DeepCausalSNN_Event:
             if new_h2 is not None and len(new_h2) > 0:
                 cand = np.asarray(new_h2, dtype=int)
                 #k_wta: only the k neurons with the highest membrane potential are allowed to fire -> sparsity
-                k2 = int(10)
+                k2 = int(1)
                 winners_h2 = cand if cand.size <= k2 else cand[np.argpartition(-v_pre_h2[cand], k2 - 1)[:k2]]
                 # optionally apply inhibition
-                self.h2.apply_global_inhibition(cand.size)
+                self.h2.apply_global_inhibition(len(winners_h2))
                 for i in winners_h2:
                     spikes['h2'].append((self.t_global, int(i)))
                     heapq.heappush(evq, Event(self.t_global + d_ax, 'h2', int(i)))
@@ -314,6 +336,16 @@ class DeepCausalSNN_Event:
                 t_out = pending_out[sample_idx]
                 t_tgt = pending_tgt[sample_idx]
                 latency_loss = (t_out - t_tgt) ** 2
+
+                #very inefficient but reward computing
+                loss_scale = (params['encoding_window'] ** 2)  # typische max. Abweichung in ms²
+                loss_dimless = float(latency_loss) / max(1e-9, loss_scale)
+                k = 5.0  # Empfindlichkeit
+                raw = 1.0 / (1.0 + k * loss_dimless)
+                r = self.syn_h2out.reward_min + (self.syn_h2out.reward_max - self.syn_h2out.reward_min) * raw
+                self.syn_h2out.set_reward(r)
+
+
                 # model._log_sample_latency_loss(latency_loss)  # <<< ADD (pro Sample)
                 loss.append((self.t_global, (t_out - t_tgt) ** 2))
                 del pending_out[sample_idx]

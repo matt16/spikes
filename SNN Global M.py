@@ -14,9 +14,13 @@ import matplotlib.pyplot as plt
 EPS = 1e-12
 
 # ---------------------------- Utilities ----------------------------
-def exp_decay_inplace(arr: np.ndarray, dt: float, tau: float):
-    if dt <= 0.0 or tau <= EPS: return
-    arr *= math.exp(-dt / tau)
+# def exp_decay_inplace(arr: np.ndarray, dt: float, tau: float):
+#     if dt <= 0.0 or tau <= EPS: return
+#     arr *= math.exp(-dt / tau)
+
+def exp_decay_inplace(arr, dt, tau):
+    if dt <= 0.0: return
+    arr *= np.exp(-dt / np.maximum(tau, EPS))  # vector of decays
 
 class ExpTrace:
     """Exponentially-decaying trace; event-driven."""
@@ -47,13 +51,12 @@ class Event:
 # ---------------------------- LIF Population ----------------------------
 class LIFPopulation:
     """Event-driven LIF with adaptive threshold + refractory; global time aware."""
-    def __init__(self, n: int, tau_m: float=20.0, v_thresh: float=1.0,
-                 v_reset: float=0.0, refractory: float=2.0,
-                 inhib: float=0.0, thr_adapt: float=0.2, thr_tau: float=50.0,
-                 name: str="pop"):
+    def __init__(self, n, tau_m=20.0, v_thresh=1.0, v_reset=0.0, refractory=2.0, inhib=0.1, thr_adapt=0.2, thr_tau=50.0, name="pop"):
         self.name = name
         self.n = int(n)
         self.tau_m = float(tau_m)
+        # rng = np.random.default_rng(0)
+        # self.tau_m = rng.uniform(5.0, 50.0, size=self.n)  # ms
         self.v_reset = float(v_reset)
         self.refractory = float(refractory)
         self.inhib = float(inhib)
@@ -61,12 +64,29 @@ class LIFPopulation:
         self.v = np.zeros(self.n, dtype=np.float64)
         self.t_last = 0.0
         self.t_last_spike = -1e9 * np.ones(self.n, dtype=np.float64)
+        # # Membrane and timing
+        # self.v = np.zeros(n, dtype=np.float64)
+        # self.t_last = 0.0
+        # self.t_last_spike = -1e9 * np.ones(n, dtype=np.float64)
+        self.spike_count = np.zeros(n, dtype=np.float64)  # for rate estimation
+
         # Adaptive threshold
         self.vth_base = float(v_thresh)
-        #self.thr = np.full(self.n, self.vth_base, dtype=np.float64)
-        self.thr = self.vth_base + np.random.normal(0, 0.5, size=self.n)
+        self.thr = np.full(self.n, self.vth_base, dtype=np.float64)
+        # self.thr = self.vth_base + np.random.normal(0, 0.0, size=self.n)
         self.thr_adapt = float(thr_adapt)
         self.thr_tau = float(thr_tau)
+
+        # Intrinsic plasticity (IP)
+        self.rate_trace = ExpTrace(self.n, tau=200.0)  # very slow trace (longer than encoding_window)
+        self.gain = np.ones(self.n)  # per-neuron multiplicative gain
+        self.target_rate = 0.05  # spikes per encoding window (tune this!)
+        self.gain_lr = 1e-4  # learning rate for gain updates
+
+        # AHP variables
+        self.ahp = np.zeros(self.n, dtype=np.float64)
+        self.ahp_tau = 50.0       # decay time constant of AHP
+        self.ahp_step = 0.1
 
     def decay_to(self, t: float):
         dt = t - self.t_last
@@ -75,17 +95,21 @@ class LIFPopulation:
             # thresholds relax back to baseline
             self.thr = self.vth_base + (self.thr - self.vth_base) * math.exp(-dt / max(self.thr_tau, EPS))
             self.t_last = t
+            # AHP decay
+            exp_decay_inplace(self.ahp, dt, self.ahp_tau)
+            self.t_last = t
 
     def receive_current(self, I):
         # Apply divisive inhibition: I / (1 + k * sum(I))
         total = np.sum(I)
         if total > 0:
             I = I / (1.0 + self.inhib * total)
-        self.v += I
+        self.v += I * self.gain
+        # self.v += I
 
-    def apply_global_inhibition(self, n_spikes: int):
-        if n_spikes > 0:
-            self.v -= self.inhib * n_spikes
+    # def apply_global_inhibition(self, n_spikes: int):
+    #     if n_spikes > 0:
+    #         self.v -= self.inhib * n_spikes
 
     def threshold_spikes(self, t: float) -> np.ndarray:
         """Return indices that spike at global time t; enforce refractory, reset & adapt."""
@@ -99,39 +123,52 @@ class LIFPopulation:
             if self.v[j] >= self.thr[j]:
                 spiking.append(j)
                 self.v[j] = self.v_reset
-                self.thr[j] += self.thr_adapt      # spike-triggered threshold boost
+                # self.thr[j] += self.thr_adapt      # spike-triggered threshold boost
+                self.ahp[j] += self.ahp_step        # AHP increment
                 self.t_last_spike[j] = t
+                self.spike_count[j] += 1
+            # --- intrinsic plasticity update ---
+            # self.rate_trace.decay_to(t)
+            # self.rate_trace.add(j, 1.0)
+        err = self.spike_count / max(t - self.t_last + 1e-12, 1e-12) - self.target_rate
+        # self.gain *= np.exp(-self.gain_lr * err)
+        self.gain -= self.gain_lr * err
+        self.gain = np.clip(self.gain, 0.7, 5.0)
+        # # normalize gains across population
+        # self.gain /= np.mean(self.gain)
+        # self.gain = 1.0
         if spiking:
             return np.array(spiking, dtype=np.int64)
         return np.empty(0, dtype=np.int64)
 
     def reset(self):
         self.v[:] = self.v_reset
-        self.thr[:] = self.vth_base + np.random.normal(0, 0.5, size=self.n)
-        # self.thr[:] = self.vth_base
+        # self.thr[:] = self.vth_base + np.random.normal(0, 0.0, size=self.n)
+        self.thr[:] = self.vth_base
         self.t_last = 0.0
         self.t_last_spike[:] = -1e9
 
 # ---------------------------- Synapse with STDP + Oja ----------------------------
 class SynapseMatrix:
-    def __init__(self, n_pre, n_post, A_plus=0.01, A_minus=0.012, alpha=0.001,
-                 tau_pre=20.0, tau_post=20.0, dale_ratio=0.8, learn=True, name: str="syn"):
+    def __init__(self, n_pre, n_post, A_plus=0.01, A_minus=0.012, alpha=0.001, tau_pre=20.0, tau_post=20.0, dale_ratio=0.8, g_exc=1.0, g_inh=0.3, learn=True, name ="syn"):
         self.name = name
         self.n_pre = n_pre
         self.n_post = n_post
         self.learn = learn
-        # Random initial weights
-        self.W = np.random.rand(n_pre, n_post) * 0.1
         # ---- Dale’s law ----
         # Randomly assign excitatory (+1) or inhibitory (-1) for each presynaptic neuron
-        signs = np.ones(n_pre)
-        n_exc = int(dale_ratio * n_pre)
+        signs = -1.0 * np.ones(n_pre)
+        n_exc = max(1, int(dale_ratio * self.n_pre))
         exc_idx = np.random.choice(n_pre, size=n_exc, replace=False)
-        signs[:] = -1.0   # default inhibitory
         signs[exc_idx] = 1.0  # excitatory
         self.dale_signs = signs  # save for later use
-        # Apply to weight matrix
-        self.W *= self.dale_signs[:, None]
+        # Random initial weights
+        W = np.random.rand(n_pre, n_post) * 0.1
+        # add tiny floor to excitatory rows so they’re not all ~0
+        W[exc_idx, :] += 0.02
+        # apply Dale signs and row gains
+        row_gain = np.where(self.dale_signs > 0.0, g_exc, g_inh)[:, None]
+        self.W = (W * self.dale_signs[:, None]) * row_gain
         # Hebbian/Oja learning params
         self.A_plus = A_plus
         self.A_minus = A_minus
@@ -167,10 +204,12 @@ class SynapseMatrix:
     def _dale_clip(self):
         """Enforce Dale’s law by clipping weights to correct sign."""
         for i in range(self.n_pre):
-            if self.dale_signs[i] > 0:
-                self.W[i, :] = np.clip(self.W[i, :], 0.0, None)   # excitatory
-            else:
-                self.W[i, :] = np.clip(self.W[i, :], None, 0.0)   # inhibitory
+            exc_rows = self.dale_signs > 0.0
+            inh_rows = ~exc_rows
+            if np.any(exc_rows):
+                self.W[exc_rows, :] = np.clip(self.W[exc_rows, :], 0.0, None)
+            if np.any(inh_rows):
+                self.W[inh_rows, :] = np.clip(self.W[inh_rows, :], None, 0.0)
 
     def reset(self):
         self.pre_trace.val[:] = 0.0
@@ -202,19 +241,19 @@ class DeepCausalSNN_Event:
     def __init__(self, n_in: int, n_h1: int, n_h2: int, n_out: int, params: dict):
 
         # Populations
-        self.h1 = LIFPopulation(n_h1, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.1), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h1')
-        self.h2 = LIFPopulation(n_h2, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.1), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h2')
-        self.out = LIFPopulation(n_out, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.0), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='out')
+        self.h1 = LIFPopulation(n_h1, tau_m = 40.0, v_thresh= 0.1, v_reset= 0.0, refractory=1.0, inhib=0.1, thr_adapt=0.1, thr_tau=30.0, name='h1')
+        self.h2 = LIFPopulation(n_h2, tau_m = 40.0, v_thresh= 0.1, v_reset= 0.0, refractory=1.0, inhib=0.1, thr_adapt=0.1, thr_tau=30.0, name='h2')
+        self.out = LIFPopulation(n_out, tau_m= 40.0, v_thresh= 0.1, v_reset=0.0, refractory=1.0, inhib=0.1, thr_adapt=0.1, thr_tau=30.0, name='out')
 
         # Synapses
         #TODO: prevent synchronicity of neuron firing...
-        self.in_h1  = SynapseMatrix(n_in,  n_h1,  **params.get('syn_in',  {}), name='in->h1')
-        self.h1_rec = SynapseMatrix(n_h1,  n_h1,  **params.get('syn_rec1', {}), name='h1->h1')
-        self.h1_h2  = SynapseMatrix(n_h1,  n_h2,  **params.get('syn_12',   {}), name='h1->h2')
-        self.h2_rec = SynapseMatrix(n_h2,  n_h2,  **params.get('syn_rec2', {}), name='h2->h2')
+        self.in_h1  = SynapseMatrix(n_in,  n_h1,  dale_ratio=1.0, g_exc=1.0, g_inh=0.2,  A_plus=0.03, A_minus=0.01, alpha=1e-4, name='in->h1')
+        self.h1_rec = SynapseMatrix(n_h1,  n_h1,  dale_ratio=0.5,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h1->h1')
+        self.h1_h2  = SynapseMatrix(n_h1,  n_h2,  dale_ratio=0.9,  g_exc=1.0, g_inh=0.3,  A_plus=0.02, A_minus=0.01, alpha=1e-4, name='h1->h2')
+        self.h2_rec = SynapseMatrix(n_h2,  n_h2,  dale_ratio=0.5,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h2->h2')
 
         #TODO: include reward function
-        self.syn_h2out = SynapseMatrix(n_h2, n_out, **params.get('syn_rec2', {}), name='h2->out')
+        self.syn_h2out = SynapseMatrix(n_h2,  n_out, dale_ratio=1.0,  g_exc=1.0, g_inh=0.0,  A_plus=0.02, A_minus=0.0,  alpha=1e-4, name='h2->out')
 
         # Encoders
         self.enc_in  = LatencyEncoder(window=params['encoding_window'])
@@ -239,7 +278,7 @@ class DeepCausalSNN_Event:
         [syn.reset() for syn in [self.in_h1, self.h1_rec, self.h1_h2, self.h2_rec, self.syn_h2out]]
 
     # ---- core: process a stream of samples sequentially on the global clock ----
-    def run_stream(self, x_batch, y_batch, encoding_window=5.0, d_ax=0.5):
+    def run_stream(self, x_batch, y_batch, encoding_window=50.0, d_ax=0.5):
         # Continuous event-driven run over a batch, using absolute global time.
         B = len(x_batch)
         evq = []
@@ -341,7 +380,7 @@ class DeepCausalSNN_Event:
 # ---------------------------- Main ----------------------------
 if __name__ == "__main__":
     np.random.seed(7)
-    n_epochs, B = 15, 50
+    n_epochs, B = 5, 10
     N_IN, N_OUT = 2, 1
     t_max_per_sample = 50
     params = {"n_h1": 80, "n_h2": 60, "encoding_window": t_max_per_sample}

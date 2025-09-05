@@ -14,10 +14,6 @@ import matplotlib.pyplot as plt
 EPS = 1e-12
 
 # ---------------------------- Utilities ----------------------------
-# def exp_decay_inplace(arr: np.ndarray, dt: float, tau: float):
-#     if dt <= 0.0 or tau <= EPS: return
-#     arr *= math.exp(-dt / tau)
-
 def exp_decay_inplace(arr, dt, tau):
     if dt <= 0.0: return
     arr *= np.exp(-dt / np.maximum(tau, EPS))  # vector of decays
@@ -64,17 +60,13 @@ class LIFPopulation:
         self.v = np.zeros(self.n, dtype=np.float64)
         self.t_last = 0.0
         self.t_last_spike = -1e9 * np.ones(self.n, dtype=np.float64)
-        # # Membrane and timing
-        # self.v = np.zeros(n, dtype=np.float64)
-        # self.t_last = 0.0
-        # self.t_last_spike = -1e9 * np.ones(n, dtype=np.float64)
         self.spike_count = np.zeros(n, dtype=np.float64)  # for rate estimation
 
         # Adaptive threshold
         self.vth_base = float(v_thresh)
         self.thr = np.full(self.n, self.vth_base, dtype=np.float64)
-        # self.thr = self.vth_base + np.random.normal(0, 0.0, size=self.n)
-        self.thr_adapt = float(thr_adapt)
+        self.thr = self.vth_base + np.random.normal(0, 0.5, size=self.n)
+        # self.thr_adapt = float(thr_adapt)
         self.thr_tau = float(thr_tau)
 
         # Intrinsic plasticity (IP)
@@ -92,7 +84,7 @@ class LIFPopulation:
         dt = t - self.t_last
         if dt > 0.0:
             exp_decay_inplace(self.v, dt, self.tau_m)
-            # thresholds relax back to baseline
+            # TODO: try with constant thr NOT: thresholds relax back to baseline
             self.thr = self.vth_base + (self.thr - self.vth_base) * math.exp(-dt / max(self.thr_tau, EPS))
             self.t_last = t
             # AHP decay
@@ -107,10 +99,6 @@ class LIFPopulation:
         self.v += I * self.gain
         # self.v += I
 
-    # def apply_global_inhibition(self, n_spikes: int):
-    #     if n_spikes > 0:
-    #         self.v -= self.inhib * n_spikes
-
     def threshold_spikes(self, t: float) -> np.ndarray:
         """Return indices that spike at global time t; enforce refractory, reset & adapt."""
         spiking = []
@@ -120,31 +108,30 @@ class LIFPopulation:
                 # keep near reset (prevents drift above thr)
                 self.v[j] = self.v_reset
                 continue
-            if self.v[j] >= self.thr[j]:
+            # effective_v = self.v[j] - self.ahp[j]
+            effective_v = self.v[j]
+            if effective_v >= self.thr[j]:
                 spiking.append(j)
                 self.v[j] = self.v_reset
                 # self.thr[j] += self.thr_adapt      # spike-triggered threshold boost
                 self.ahp[j] += self.ahp_step        # AHP increment
                 self.t_last_spike[j] = t
                 self.spike_count[j] += 1
-            # --- intrinsic plasticity update ---
-            # self.rate_trace.decay_to(t)
-            # self.rate_trace.add(j, 1.0)
-        err = self.spike_count / max(t - self.t_last + 1e-12, 1e-12) - self.target_rate
-        # self.gain *= np.exp(-self.gain_lr * err)
-        self.gain -= self.gain_lr * err
-        self.gain = np.clip(self.gain, 0.7, 5.0)
+        # --- intrinsic plasticity update ---
+        # err = self.spike_count / max(t - self.t_last + 1e-12, 1e-12) - self.target_rate
+        # self.gain -= self.gain_lr * err
+        # self.gain = np.clip(self.gain, 1.0, 5.0)
         # # normalize gains across population
         # self.gain /= np.mean(self.gain)
-        # self.gain = 1.0
+        self.gain = 1.0
         if spiking:
             return np.array(spiking, dtype=np.int64)
         return np.empty(0, dtype=np.int64)
 
     def reset(self):
         self.v[:] = self.v_reset
-        # self.thr[:] = self.vth_base + np.random.normal(0, 0.0, size=self.n)
-        self.thr[:] = self.vth_base
+        self.thr[:] = self.vth_base + np.random.normal(0, 0.5, size=self.n)
+        # self.thr[:] = self.vth_base
         self.t_last = 0.0
         self.t_last_spike[:] = -1e9
 
@@ -168,7 +155,8 @@ class SynapseMatrix:
         W[exc_idx, :] += 0.02
         # apply Dale signs and row gains
         row_gain = np.where(self.dale_signs > 0.0, g_exc, g_inh)[:, None]
-        self.W = (W * self.dale_signs[:, None]) * row_gain
+        # self.W = (W * self.dale_signs[:, None]) * row_gain
+        self.W = (W * self.dale_signs[:, None])
         # Hebbian/Oja learning params
         self.A_plus = A_plus
         self.A_minus = A_minus
@@ -248,9 +236,9 @@ class DeepCausalSNN_Event:
         # Synapses
         #TODO: prevent synchronicity of neuron firing...
         self.in_h1  = SynapseMatrix(n_in,  n_h1,  dale_ratio=1.0, g_exc=1.0, g_inh=0.2,  A_plus=0.03, A_minus=0.01, alpha=1e-4, name='in->h1')
-        self.h1_rec = SynapseMatrix(n_h1,  n_h1,  dale_ratio=0.5,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h1->h1')
-        self.h1_h2  = SynapseMatrix(n_h1,  n_h2,  dale_ratio=0.9,  g_exc=1.0, g_inh=0.3,  A_plus=0.02, A_minus=0.01, alpha=1e-4, name='h1->h2')
-        self.h2_rec = SynapseMatrix(n_h2,  n_h2,  dale_ratio=0.5,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h2->h2')
+        self.h1_rec = SynapseMatrix(n_h1,  n_h1,  dale_ratio=0.8,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h1->h1')
+        self.h1_h2  = SynapseMatrix(n_h1,  n_h2,  dale_ratio=0.8,  g_exc=1.0, g_inh=0.3,  A_plus=0.02, A_minus=0.01, alpha=1e-4, name='h1->h2')
+        self.h2_rec = SynapseMatrix(n_h2,  n_h2,  dale_ratio=0.8,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h2->h2')
 
         #TODO: include reward function
         self.syn_h2out = SynapseMatrix(n_h2,  n_out, dale_ratio=1.0,  g_exc=1.0, g_inh=0.0,  A_plus=0.02, A_minus=0.0,  alpha=1e-4, name='h2->out')

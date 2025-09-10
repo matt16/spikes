@@ -280,6 +280,7 @@ class DeepCausalSNN_Event:
 
             # After delivering currents, check for new spikes
             new_h1 = self.h1.threshold_spikes(t)
+            print('h1', new_h1)
             if new_h1 is not None and len(new_h1) > 0:
                 # optionally apply inhibition
                 self.h1.apply_global_inhibition(len(new_h1))
@@ -289,10 +290,12 @@ class DeepCausalSNN_Event:
 
             v_pre_h2 = self.h2.v.copy()
             new_h2 = self.h2.threshold_spikes(t)
+            print('h2',new_h2,self.t_global)
+            print('eventqueue', evq)
             if new_h2 is not None and len(new_h2) > 0:
                 cand = np.asarray(new_h2, dtype=int)
                 #k_wta: only the k neurons with the highest membrane potential are allowed to fire -> sparsity
-                k2 = int(10)
+                k2 = int(1)
                 winners_h2 = cand if cand.size <= k2 else cand[np.argpartition(-v_pre_h2[cand], k2 - 1)[:k2]]
                 # optionally apply inhibition
                 self.h2.apply_global_inhibition(cand.size)

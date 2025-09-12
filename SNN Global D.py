@@ -49,7 +49,7 @@ class LIFPopulation:
     """Event-driven LIF with adaptive threshold + refractory; global time aware."""
     def __init__(self, n: int, tau_m: float=20.0, v_thresh: float=1.0,
                  v_reset: float=0.0, refractory: float=2.0,
-                 inhib: float=0.1, thr_adapt: float=0.2, thr_tau: float=50.0,
+                 inhib: float=0.2, thr_adapt: float=0.4, thr_tau: float=30.0,
                  name: str="pop"):
         self.name = name
         self.n = int(n)
@@ -179,8 +179,8 @@ class DeepCausalSNN_Event:
     def __init__(self, n_in: int, n_h1: int, n_h2: int, n_out: int, params: dict):
 
         # Populations
-        self.h1 = LIFPopulation(n_h1, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.1), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h1')
-        self.h2 = LIFPopulation(n_h2, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.1), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h2')
+        self.h1 = LIFPopulation(n_h1, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.2), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h1')
+        self.h2 = LIFPopulation(n_h2, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.2), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='h2')
         self.out = LIFPopulation(n_out, tau_m=params.get('tau_m', 20.0), v_thresh=params.get('v_thresh', 0.1), v_reset=params.get('v_reset', 0.0), refractory=params.get('refractory', 2.0), inhib=params.get('inhib', 0.0), thr_adapt=params.get('thr_adapt', 0.2), thr_tau=params.get('thr_tau', 50.0), name='out')
 
         # Synapses
@@ -280,17 +280,28 @@ class DeepCausalSNN_Event:
 
             # After delivering currents, check for new spikes
             new_h1 = self.h1.threshold_spikes(t)
+            print('h1', new_h1)
             if new_h1 is not None and len(new_h1) > 0:
                 # optionally apply inhibition
+                self.h1.apply_global_inhibition(len(new_h1))
                 for j in new_h1:
                     spikes['h1'].append((self.t_global, int(j)))
                     heapq.heappush(evq, Event(self.t_global + d_ax, 'h1', int(j)))
 
+            v_pre_h2 = self.h2.v.copy()
             new_h2 = self.h2.threshold_spikes(t)
+            print('h2',new_h2,self.t_global)
+            print('eventqueue', evq)
             if new_h2 is not None and len(new_h2) > 0:
-                for j in new_h2:
-                    spikes['h2'].append((self.t_global, int(j)))
-                    heapq.heappush(evq, Event(self.t_global + d_ax, 'h2', int(j)))
+                cand = np.asarray(new_h2, dtype=int)
+                #k_wta: only the k neurons with the highest membrane potential are allowed to fire -> sparsity
+                k2 = int(1)
+                winners_h2 = cand if cand.size <= k2 else cand[np.argpartition(-v_pre_h2[cand], k2 - 1)[:k2]]
+                # optionally apply inhibition
+                self.h2.apply_global_inhibition(cand.size)
+                for i in winners_h2:
+                    spikes['h2'].append((self.t_global, int(i)))
+                    heapq.heappush(evq, Event(self.t_global + d_ax, 'h2', int(i)))
 
             new_out = self.out.threshold_spikes(t)
             if new_out is not None and len(new_out) > 0:
@@ -300,6 +311,7 @@ class DeepCausalSNN_Event:
                         pending_out[sample_idx] = t
                     heapq.heappush(evq, Event(self.t_global + d_ax, 'out', int(j)))
 
+            ###PROBLEM: no spike -> 0 Loss: trains not to spike:(
             # --- Loss computation (latency-based) ---
             if sample_idx in pending_out and sample_idx in pending_tgt:
                 t_out = pending_out[sample_idx]
@@ -314,7 +326,7 @@ class DeepCausalSNN_Event:
 
 # ---------------------------- Main ----------------------------
 if __name__ == "__main__":
-    np.random.seed(7)
+    np.random.seed(50)
     n_epochs, B = 25, 20
     N_IN, N_OUT = 2, 1
     t_max_per_sample = 50

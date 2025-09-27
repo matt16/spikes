@@ -22,134 +22,219 @@ def safe_log(x):
 # ---------------- SynapseMatrix ----------------
 class SynapseMatrix:
     """
-    Synapse matrix with:
-      - pre_trace: exponential PSC per presynaptic neuron (drives postsyn currents)
-      - post_trace: exponential trace for postsynaptic activity (learning)
-      - pre_last/post_last: last spike times for STDP ordering decisions
-      - update(pre_idx, post_idx, anti_hebb=...) applies Hebb/Oja or anti-Hebb
+    Basic-Ersatz für die ursprüngliche SynapseMatrix (nur feste Gewichte, kein Lernen):
+      - gleiche API: on_pre_spike, on_post_spike, update, reset_dw_log, reset_traces
+      - führt pre_last/post_last (Zeitstempel) für deine anti-Hebb-Abfragen
+      - Wirkung: I_post = x_t * W[pre_idx, :]
+      - Ignoriert: Traces, Oja/anti-Hebb-Updates, Reward; update() ist no-op.
     """
     def __init__(self, n_pre, n_post, eta=1e-3, tau_pre=20.0, tau_post=50.0,
-                 oja=True, is_output=False, seed=None):
+                 oja=False, is_output=False, seed=None, W_init=None):
         rng = np.random.default_rng(seed)
-        self.W = rng.uniform(0.5, 1.0, size=(n_pre, n_post))
+
+        if W_init is None:
+            W = rng.uniform(0.5, 1.0, size=(n_pre, n_post))
+        else:
+            W = np.array(W_init, dtype=float)
+            if W.shape != (n_pre, n_post):
+                raise ValueError("W_init hat falsche Form")
+
+        self.W = W.astype(float)
+        self.n_pre = int(n_pre)
+        self.n_post = int(n_post)
+
+        # Kompatibilitäts-Attribute (werden später ggf. genutzt)
         self.eta = float(eta)
         self.tau_pre = float(tau_pre)
-        self.n_pre = n_pre
-        self.n_post = n_post
         self.tau_post = float(tau_post)
         self.oja = bool(oja)
         self.is_output = bool(is_output)
 
-        # traces & timing
-        self.pre_trace = np.zeros(n_pre, dtype=float)   # PSC-like trace per presyn
-        self.post_trace = np.zeros(n_post, dtype=float) # learning trace per post
-        self.pre_last = -1e9 * np.ones(n_pre, dtype=float)
-        self.post_last = -1e9 * np.ones(n_post, dtype=float)
+        # Zeitstempel für anti-Hebb-Entscheidung (vom Wrapper genutzt)
+        self.pre_last = -1e9 * np.ones(self.n_pre, dtype=float)
+        self.post_last = -1e9 * np.ones(self.n_post, dtype=float)
         self.t_last = 0.0
 
-        # logging
+        # Logging kompatibel halten
         self.last_dw_sum = 0.0
 
     def decay_to(self, t):
-        dt = t - self.t_last
-        if dt > 0:
-            exp_decay_inplace(self.pre_trace, dt, self.tau_pre)
-            exp_decay_inplace(self.post_trace, dt, self.tau_post)
-            self.t_last = t
+        # In der Basic-Variante keine Traces -> nur Zeitstempel fortschreiben
+        self.t_last = float(t)
 
     def on_pre_spike(self, pre_idx, t, x_t=1.0):
-        """Called when presynaptic neuron spikes (or receives analog input).
-           Returns vector of postsynaptic currents (length n_post)."""
+        """
+        Gibt den Postsynapsen-Stromvektor zurück: I_post = x_t * W[pre_idx, :].
+        Setzt außerdem pre_last[pre_idx] = t für anti-Hebb-Abfragen im Wrapper.
+        """
         self.decay_to(t)
-        self.pre_trace[pre_idx] += x_t
-        self.pre_last[pre_idx] = t
-        # postsynaptic current for each post neuron = sum_over_pre W[pre,post] * pre_trace[pre]
-        # efficient: vector multiply pre_trace @ W -> length n_post
-        return self.pre_trace @ self.W
+        self.pre_last[int(pre_idx)] = float(t)
+        row = self.W[int(pre_idx), :]
+        return np.asarray(row, dtype=float) * float(x_t)
 
     def on_post_spike(self, post_idx, t):
-        """Called when a postsynaptic neuron spikes (for learning trace)."""
+        """
+        No-op (Basic). Setzt nur post_last[post_idx] = t zur Kompatibilität.
+        """
         self.decay_to(t)
-        self.post_trace[post_idx] += 1.0
-        self.post_last[post_idx] = t
+        self.post_last[int(post_idx)] = float(t)
 
     def update(self, pre_idx, post_idx, reward=None, anti_hebb=False):
-        """Update single synapse W[pre_idx, post_idx]. Returns |dw| for logging."""
-        lr = float(self.eta)
-        if self.is_output and (reward is not None):
-            lr *= float(reward)
-            # lr *= 1
-        sign = -1.0 if anti_hebb else 1.0
-        dw = sign * lr * self.pre_trace[pre_idx] * self.post_trace[post_idx]
-        if self.oja:
-            dw -= lr * (self.post_trace[post_idx] ** 2) * self.W[pre_idx, post_idx]
-        self.W[pre_idx, post_idx] += dw
-        self.W[pre_idx, post_idx] = np.clip(self.W[pre_idx, post_idx], 0.0, 0.2)
-        self.last_dw_sum += abs(dw)
-        return abs(dw)
+        """
+        Kein Lernen in der Basic-Variante. Rückgabe 0.0 für kompatibles Logging.
+        """
+        return 0.0
 
     def reset_dw_log(self):
-        val = self.last_dw_sum
+        val = float(self.last_dw_sum)
         self.last_dw_sum = 0.0
         return val
 
     def reset_traces(self):
-        self.pre_trace[:] = 0.0
-        self.post_trace[:] = 0.0
-        self.pre_last[:] = -1e9
-        self.post_last[:] = -1e9
-        self.t_last = 0.0
+        # Basic: keine Traces vorhanden
+        pass
+
 
 # ---------------- LIF Population (PSC + membrane) ----------------
+import numpy as np
+
 class LIFPopulation:
     """
-    Event-driven LIF population with:
-      - PSC per neuron (i_syn) decaying with tau_syn
-      - membrane V decaying with tau_m
-      - compute_next_spike assumes i_syn stays constant (analytic crossing)
-      - local lateral inhibition (configurable radius & strength)
-      - continuous/homeostatic gain adaptation (rate estimate + gain_lr)
+    Adapter-Implementierung der LIF-Population im eventgetriebenen Stil,
+    API-kompatibel zu deinem bestehenden run_epoch.
+
+    Hinweis: Diese Version bildet exakt das Verhalten des bisherigen
+    eventgetriebenen LIF nach (Analytik für v/i_syn, Spike-Zeit-Vorhersage),
+    damit dein Wrapper unverändert weiterläuft. Im nächsten Schritt können
+    wir die Interna schrittweise auf Brian2 umstellen, ohne die äußere API
+    zu verändern.
     """
     def __init__(self, n, tau_m=20.0, tau_syn=15.0, v_thresh=1.0, v_reset=0.0,
-                 refractory=0.0, inhib=0.1, name="pop",
+                 refractory=0.0, inhib=0.0, name="pop",
                  target_rate=0.05, gain_lr=1e-4, tau_homeo=1000.0,
-                 inh_strength=0.5, inh_radius=3):
+                 inh_strength=0.0, inh_radius=0):
         self.name = name
         self.n = int(n)
 
-        # time constants & thresholds
+        # Zeitkonstanten & Schwellen
         self.tau_m = float(tau_m)
         self.tau_syn = float(tau_syn)
         self.v_thresh = float(v_thresh)
         self.v_reset = float(v_reset)
         self.refractory = float(refractory)
 
-        # divisive inhibition on incoming current
+        # (Extras zunächst neutral)
         self.inhib = float(inhib)
-
-        # states
-        self.v = np.zeros(self.n, dtype=float)        # membrane potential
-        self.i_syn = np.zeros(self.n, dtype=float)    # postsynaptic currents (PSC)
-        self.t_last_spike = -1e9 * np.ones(self.n, dtype=float)
-
-        # multiplicative input gain (homeostatically adapted)
-        self.gain = np.ones(self.n, dtype=float)
-        self.gain_lr = float(gain_lr)
-
-        # homeostasis / rate tracking
-        self.spike_count = np.zeros(self.n, dtype=float)
-        self.target_rate = float(target_rate)
-        self.rate_estimate = np.zeros(self.n, dtype=float)
-        self.tau_homeo = float(tau_homeo)  # time constant for rate averaging
-        # alpha_homeo used for discrete bump on spike (kept small)
-        self.alpha_homeo = 1.0 / max(1.0, float(tau_homeo))
-
-        # local inhibition params
         self.inh_strength = float(inh_strength)
         self.inh_radius = int(inh_radius)
 
-        # time bookkeeping per neuron
+        # Zustände
+        self.v = np.zeros(self.n, dtype=float)
+        self.i_syn = np.zeros(self.n, dtype=float)
+        self.t_last_spike = -1e9 * np.ones(self.n, dtype=float)
+
+        # Homeostase-Placeholder (derzeit neutral)
+        self.gain = np.ones(self.n, dtype=float)
+        self.gain_lr = float(gain_lr)
+        self.spike_count = np.zeros(self.n, dtype=float)
+        self.target_rate = float(target_rate)
+        self.rate_estimate = np.zeros(self.n, dtype=float)
+        self.tau_homeo = float(tau_homeo)
+        self.alpha_homeo = 1.0 / max(1.0, float(tau_homeo))
+
+        # Zeitbuchhaltung pro Neuron
         self.t_last_update = np.zeros(self.n, dtype=float)
+
+    # -------- Zustände zu Zeit t abklingen lassen --------
+    def decay_to(self, t):
+        dt = t - self.t_last_update
+        mask = dt > 0
+        if not np.any(mask):
+            return
+        dt_mask = dt[mask]
+        self.v[mask] *= np.exp(-dt_mask / self.tau_m)
+        self.i_syn[mask] *= np.exp(-dt_mask / self.tau_syn)
+        self.rate_estimate[mask] *= np.exp(-dt_mask / self.tau_homeo)
+        self.t_last_update[mask] = t
+
+    # -------- analytische Spikezeit-Vorhersage --------
+    def compute_next_spike(self, j, I_drive, t_now, V_before):
+        t_earliest = max(t_now, self.t_last_spike[j] + self.refractory)
+        V0 = V_before
+        Vth = self.v_thresh
+        V_inf = I_drive * self.tau_m
+        if V_inf <= Vth:
+            return None
+        if V0 >= Vth and t_now >= t_earliest:
+            return t_now
+        denom = (V0 - V_inf)
+        num = (Vth - V_inf)
+        if denom == 0.0:
+            return None
+        ratio = num / denom
+        if ratio <= 0.0:
+            return None
+        # sichere Log
+        val = np.log(ratio) if ratio > 0 else np.nan
+        if not np.isfinite(val):
+            return None
+        dt_cross = - self.tau_m * val
+        if not np.isfinite(dt_cross) or dt_cross < 0.0:
+            return None
+        t_cross = t_now + dt_cross
+        if t_cross < t_earliest:
+            return None
+        return t_cross
+
+    # -------- eingehenden Stromvektor verarbeiten --------
+    def receive_current(self, I_vector, t_now):
+        self.decay_to(t_now)
+        I = np.asarray(I_vector, dtype=float)
+        if I.shape[0] != self.n:
+            raise ValueError("Input current length mismatch")
+        events = []
+        for j in range(self.n):
+            if (t_now - self.t_last_spike[j]) < self.refractory:
+                continue
+            V_before = self.v[j]
+            self.i_syn[j] += I[j] * self.gain[j]
+            t_cross = self.compute_next_spike(j, self.i_syn[j], t_now, V_before)
+            if t_cross is not None:
+                events.append((float(t_cross), int(j)))
+        return events
+
+    # -------- Spike registrieren --------
+    def register_spike(self, j, t):
+        self.decay_to(t)
+        self.v[j] = self.v_reset
+        self.t_last_spike[j] = t
+        self.spike_count[j] += 1
+        # Laterale Inhibition (derzeit neutral, nur falls gesetzt)
+        if self.inh_strength != 0.0 and self.inh_radius > 0:
+            for offset in range(-self.inh_radius, self.inh_radius + 1):
+                k = j + offset
+                if 0 <= k < self.n and k != j:
+                    self.v[k] -= self.inh_strength
+        # Homeostase (Placeholder)
+        self.rate_estimate[j] += self.alpha_homeo
+        self.gain += self.gain_lr * (self.target_rate - self.rate_estimate)
+        self.gain = np.clip(self.gain, 0.1, 10.0)
+
+    def is_spike_valid(self, j, t):
+        return (t - self.t_last_spike[j]) >= self.refractory
+
+    # -------- Hauskeeping --------
+    def reset_spike_flags(self):
+        self.spike_count[:] = 0.0
+
+    def state_reset(self):
+        self.v[:] = 0.0
+        self.i_syn[:] = 0.0
+        self.t_last_spike[:] = -1e9
+        self.t_last_update[:] = 0.0
+        self.spike_count[:] = 0.0
+        self.rate_estimate[:] = 0.0
+        self.gain[:] = 1.0
 
     # ---------- decay states to time t ----------
     def decay_to(self, t):

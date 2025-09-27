@@ -27,9 +27,9 @@ T = 40
 inhib_h1 = 0.0
 inhib_h2 = 0.0
 
-eta_in_h1  = 0.0 * 1e-3
-eta_h1_h2  = 0.0 * 1e-3
-eta_h2_out = 0.0 * 1e-3
+eta_in_h1  = 1e-3
+eta_h1_h2  = 1e-3
+eta_h2_out = 1e-3
 oja_coeff  = 0.0
 
 EPOCHS = 2

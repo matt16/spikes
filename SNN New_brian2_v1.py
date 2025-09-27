@@ -22,78 +22,83 @@ def safe_log(x):
 # ---------------- SynapseMatrix ----------------
 class SynapseMatrix:
     """
-    Basic-Ersatz für die ursprüngliche SynapseMatrix (nur feste Gewichte, kein Lernen):
-      - gleiche API: on_pre_spike, on_post_spike, update, reset_dw_log, reset_traces
-      - führt pre_last/post_last (Zeitstempel) für deine anti-Hebb-Abfragen
-      - Wirkung: I_post = x_t * W[pre_idx, :]
-      - Ignoriert: Traces, Oja/anti-Hebb-Updates, Reward; update() ist no-op.
+    Synapse matrix with:
+      - pre_trace: exponential PSC per presynaptic neuron (drives postsyn currents)
+      - post_trace: exponential trace for postsynaptic activity (learning)
+      - pre_last/post_last: last spike times for STDP ordering decisions
+      - update(pre_idx, post_idx, anti_hebb=...) applies Hebb/Oja or anti-Hebb
     """
     def __init__(self, n_pre, n_post, eta=1e-3, tau_pre=20.0, tau_post=50.0,
-                 oja=False, is_output=False, seed=None, W_init=None):
+                 oja=True, is_output=False, seed=None):
         rng = np.random.default_rng(seed)
-
-        if W_init is None:
-            W = rng.uniform(0.5, 1.0, size=(n_pre, n_post))
-        else:
-            W = np.array(W_init, dtype=float)
-            if W.shape != (n_pre, n_post):
-                raise ValueError("W_init hat falsche Form")
-
-        self.W = W.astype(float)
-        self.n_pre = int(n_pre)
-        self.n_post = int(n_post)
-
-        # Kompatibilitäts-Attribute (werden später ggf. genutzt)
+        self.W = rng.uniform(0.5, 1.0, size=(n_pre, n_post))
         self.eta = float(eta)
         self.tau_pre = float(tau_pre)
+        self.n_pre = n_pre
+        self.n_post = n_post
         self.tau_post = float(tau_post)
         self.oja = bool(oja)
         self.is_output = bool(is_output)
 
-        # Zeitstempel für anti-Hebb-Entscheidung (vom Wrapper genutzt)
-        self.pre_last = -1e9 * np.ones(self.n_pre, dtype=float)
-        self.post_last = -1e9 * np.ones(self.n_post, dtype=float)
+        # traces & timing
+        self.pre_trace = np.zeros(n_pre, dtype=float)   # PSC-like trace per presyn
+        self.post_trace = np.zeros(n_post, dtype=float) # learning trace per post
+        self.pre_last = -1e9 * np.ones(n_pre, dtype=float)
+        self.post_last = -1e9 * np.ones(n_post, dtype=float)
         self.t_last = 0.0
 
-        # Logging kompatibel halten
+        # logging
         self.last_dw_sum = 0.0
 
     def decay_to(self, t):
-        # In der Basic-Variante keine Traces -> nur Zeitstempel fortschreiben
-        self.t_last = float(t)
+        dt = t - self.t_last
+        if dt > 0:
+            exp_decay_inplace(self.pre_trace, dt, self.tau_pre)
+            exp_decay_inplace(self.post_trace, dt, self.tau_post)
+            self.t_last = t
 
     def on_pre_spike(self, pre_idx, t, x_t=1.0):
-        """
-        Gibt den Postsynapsen-Stromvektor zurück: I_post = x_t * W[pre_idx, :].
-        Setzt außerdem pre_last[pre_idx] = t für anti-Hebb-Abfragen im Wrapper.
-        """
+        """Called when presynaptic neuron spikes (or receives analog input).
+           Returns vector of postsynaptic currents (length n_post)."""
         self.decay_to(t)
-        self.pre_last[int(pre_idx)] = float(t)
-        row = self.W[int(pre_idx), :]
-        return np.asarray(row, dtype=float) * float(x_t)
+        self.pre_trace[pre_idx] += x_t
+        self.pre_last[pre_idx] = t
+        # postsynaptic current for each post neuron = sum_over_pre W[pre,post] * pre_trace[pre]
+        # efficient: vector multiply pre_trace @ W -> length n_post
+        return self.pre_trace @ self.W
 
     def on_post_spike(self, post_idx, t):
-        """
-        No-op (Basic). Setzt nur post_last[post_idx] = t zur Kompatibilität.
-        """
+        """Called when a postsynaptic neuron spikes (for learning trace)."""
         self.decay_to(t)
-        self.post_last[int(post_idx)] = float(t)
+        self.post_trace[post_idx] += 1.0
+        self.post_last[post_idx] = t
 
     def update(self, pre_idx, post_idx, reward=None, anti_hebb=False):
-        """
-        Kein Lernen in der Basic-Variante. Rückgabe 0.0 für kompatibles Logging.
-        """
-        return 0.0
+        """Update single synapse W[pre_idx, post_idx]. Returns |dw| for logging."""
+        lr = float(self.eta)
+        if self.is_output and (reward is not None):
+            lr *= float(reward)
+            # lr *= 1
+        sign = -1.0 if anti_hebb else 1.0
+        dw = sign * lr * self.pre_trace[pre_idx] * self.post_trace[post_idx]
+        if self.oja:
+            dw -= lr * (self.post_trace[post_idx] ** 2) * self.W[pre_idx, post_idx]
+        self.W[pre_idx, post_idx] += dw
+        self.W[pre_idx, post_idx] = np.clip(self.W[pre_idx, post_idx], 0.0, 0.2)
+        self.last_dw_sum += abs(dw)
+        return abs(dw)
 
     def reset_dw_log(self):
-        val = float(self.last_dw_sum)
+        val = self.last_dw_sum
         self.last_dw_sum = 0.0
         return val
 
     def reset_traces(self):
-        # Basic: keine Traces vorhanden
-        pass
-
+        self.pre_trace[:] = 0.0
+        self.post_trace[:] = 0.0
+        self.pre_last[:] = -1e9
+        self.post_last[:] = -1e9
+        self.t_last = 0.0
 
 # ---------------- LIF Population (PSC + membrane) ----------------
 class LIFPopulation:

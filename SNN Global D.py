@@ -1,484 +1,469 @@
-# ===== Event-driven Deep Causal SNN (global time, analog-friendly) =====
-#   - Latency encoding with fixed window
-#   - Event-driven LIF with refractory + adaptive thresholds
-#   - STDP (pre/post traces) + Oja stabilization
-#   - Global time stream: run_stream(X, Y)
-#   - numpy + heapq only
-from __future__ import annotations
-import math, heapq
 import numpy as np
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+import heapq
 import matplotlib.pyplot as plt
+from dataclasses import dataclass
 
-EPS = 1e-12
-
-# ---------------------------- Utilities ----------------------------
-def exp_decay_inplace(arr, dt, tau):
-    if dt <= 0.0: return
-    arr *= np.exp(-dt / np.maximum(tau, EPS))  # vector of decays
-
-class ExpTrace:
-    """Exponentially-decaying trace; event-driven."""
-    def __init__(self, size: int, tau: float):
-        self.val = np.zeros(size, dtype=np.float64)
-        self.tau = float(tau)
-        self.t_last = 0.0
-
-    def decay_to(self, t: float):
-        dt = t - self.t_last
-        if dt > 0.0:
-            exp_decay_inplace(self.val, dt, self.tau)
-            self.t_last = t
-
-    def add(self, idx: Optional[int] = None, amount: float = 1.0):
-        if idx is None:
-            self.val += amount
-        else:
-            self.val[idx] += amount
-
-# ---------------------------- Events ----------------------------
+# ---------------- Event ----------------
 @dataclass(order=True)
 class Event:
     time: float
-    src: str   # 'in', 'h1', 'h2', 'target'
+    src: str
     idx: int
 
-# ---------------------------- LIF Population ----------------------------
-class LIFPopulation:
-    """Event-driven LIF with adaptive threshold + refractory; global time aware."""
-    def __init__(self, n, tau_m=20.0, v_thresh=1.0, v_reset=0.0, refractory=2.0, inhib=0.1, thr_adapt=0.2, thr_tau=50.0, name="pop"):
-        self.name = name
-        self.n = int(n)
-        self.tau_m = float(tau_m)
-        # rng = np.random.default_rng(0)
-        # self.tau_m = rng.uniform(5.0, 50.0, size=self.n)  # ms
-        self.v_reset = float(v_reset)
-        self.refractory = float(refractory)
-        self.inhib = float(inhib)
-        # Membrane and timing
-        self.v = np.zeros(self.n, dtype=np.float64)
-        self.t_last = 0.0
-        self.t_last_spike = -1e9 * np.ones(self.n, dtype=np.float64)
-        self.spike_count = np.zeros(n, dtype=np.float64)  # for rate estimation
+# ---------------- Utility ----------------
+def exp_decay_inplace(arr, dt, tau):
+    if tau <= 0:
+        return
+    arr *= np.exp(-dt / tau)
 
-        # Adaptive threshold
-        self.vth_base = float(v_thresh)
-        self.thr = np.full(self.n, self.vth_base, dtype=np.float64)
-        self.thr = self.vth_base + np.random.normal(0, 0.5, size=self.n)
-        # self.thr_adapt = float(thr_adapt)
-        self.thr_tau = float(thr_tau)
+def safe_log(x):
+    return np.log(x) if x > 0 else float('nan')
 
-        # Intrinsic plasticity (IP)
-        self.rate_trace = ExpTrace(self.n, tau=200.0)  # very slow trace (longer than encoding_window)
-        self.gain = np.ones(self.n)  # per-neuron multiplicative gain
-        self.target_rate = 0.05  # spikes per encoding window (tune this!)
-        self.gain_lr = 1e-4  # learning rate for gain updates
-
-        # AHP variables
-        self.ahp = np.zeros(self.n, dtype=np.float64)
-        self.ahp_tau = 50.0       # decay time constant of AHP
-        self.ahp_step = 0.1
-
-    def decay_to(self, t: float):
-        dt = t - self.t_last
-        if dt > 0.0:
-            exp_decay_inplace(self.v, dt, self.tau_m)
-            # TODO: try with constant thr NOT: thresholds relax back to baseline
-            self.thr = self.vth_base + (self.thr - self.vth_base) * math.exp(-dt / max(self.thr_tau, EPS))
-            self.t_last = t
-            # AHP decay
-            exp_decay_inplace(self.ahp, dt, self.ahp_tau)
-            self.t_last = t
-
-    def receive_current(self, I):
-        # Apply divisive inhibition: I / (1 + k * sum(I))
-        total = np.sum(I)
-        if total > 0:
-            I = I / (1.0 + self.inhib * total)
-        self.v += I * self.gain
-        # self.v += I
-
-    def threshold_spikes(self, t: float) -> np.ndarray:
-        """Return indices that spike at global time t; enforce refractory, reset & adapt."""
-        spiking = []
-        for j in range(self.n):
-            # clamp while refractory
-            if (t - self.t_last_spike[j]) < self.refractory:
-                # keep near reset (prevents drift above thr)
-                self.v[j] = self.v_reset
-                continue
-            # effective_v = self.v[j] - self.ahp[j]
-            effective_v = self.v[j]
-            if effective_v >= self.thr[j]:
-                spiking.append(j)
-                self.v[j] = self.v_reset
-                # self.thr[j] += self.thr_adapt      # spike-triggered threshold boost
-                self.ahp[j] += self.ahp_step        # AHP increment
-                self.t_last_spike[j] = t
-                self.spike_count[j] += 1
-        # --- intrinsic plasticity update ---
-        # err = self.spike_count / max(t - self.t_last + 1e-12, 1e-12) - self.target_rate
-        # self.gain -= self.gain_lr * err
-        # self.gain = np.clip(self.gain, 1.0, 5.0)
-        # # normalize gains across population
-        # self.gain /= np.mean(self.gain)
-        self.gain = 1.0
-        if spiking:
-            return np.array(spiking, dtype=np.int64)
-        return np.empty(0, dtype=np.int64)
-
-    def reset(self):
-        self.v[:] = self.v_reset
-        self.thr[:] = self.vth_base + np.random.normal(0, 0.5, size=self.n)
-        # self.thr[:] = self.vth_base
-        self.t_last = 0.0
-        self.t_last_spike[:] = -1e9
-
-# ---------------------------- Synapse with STDP + Oja ----------------------------
+# ---------------- SynapseMatrix ----------------
 class SynapseMatrix:
-    def __init__(self, n_pre, n_post, A_plus=0.01, A_minus=0.012, alpha=0.001, tau_pre=20.0, tau_post=20.0, dale_ratio=0.8, g_exc=1.0, g_inh=0.3, learn=True, name ="syn"):
-        self.name = name
+    """
+    Synapse matrix with:
+      - pre_trace: exponential PSC per presynaptic neuron (drives postsyn currents)
+      - post_trace: exponential trace for postsynaptic activity (learning)
+      - pre_last/post_last: last spike times for STDP ordering decisions
+      - update(pre_idx, post_idx, anti_hebb=...) applies Hebb/Oja or anti-Hebb
+    """
+    def __init__(self, n_pre, n_post, eta=1e-3, tau_pre=20.0, tau_post=50.0,
+                 oja=True, is_output=False, seed=None):
+        rng = np.random.default_rng(seed)
+        self.W = rng.uniform(0.5, 1.0, size=(n_pre, n_post))
+        self.eta = float(eta)
+        self.tau_pre = float(tau_pre)
         self.n_pre = n_pre
         self.n_post = n_post
-        self.learn = learn
-        # ---- Dale’s law ----
-        # Randomly assign excitatory (+1) or inhibitory (-1) for each presynaptic neuron
-        signs = -1.0 * np.ones(n_pre)
-        n_exc = max(1, int(dale_ratio * self.n_pre))
-        exc_idx = np.random.choice(n_pre, size=n_exc, replace=False)
-        signs[exc_idx] = 1.0  # excitatory
-        self.dale_signs = signs  # save for later use
-        # Random initial weights
-        W = np.random.rand(n_pre, n_post) * 0.1
-        # add tiny floor to excitatory rows so they’re not all ~0
-        W[exc_idx, :] += 0.02
-        # apply Dale signs and row gains
-        row_gain = np.where(self.dale_signs > 0.0, g_exc, g_inh)[:, None]
-        # self.W = (W * self.dale_signs[:, None]) * row_gain
-        self.W = (W * self.dale_signs[:, None])
-        # Hebbian/Oja learning params
-        self.A_plus = A_plus
-        self.A_minus = A_minus
-        self.alpha = alpha
-        # Traces
-        self.pre_trace = ExpTrace(n_pre, tau=tau_pre)
-        self.post_trace = ExpTrace(n_post, tau=tau_post)
+        self.tau_post = float(tau_post)
+        self.oja = bool(oja)
+        self.is_output = bool(is_output)
 
-    def decay_to(self, t: float):
-        self.pre_trace.decay_to(t)
-        self.post_trace.decay_to(t)
+        # traces & timing
+        self.pre_trace = np.zeros(n_pre, dtype=float)   # PSC-like trace per presyn
+        self.post_trace = np.zeros(n_post, dtype=float) # learning trace per post
+        self.pre_last = -1e9 * np.ones(n_pre, dtype=float)
+        self.post_last = -1e9 * np.ones(n_post, dtype=float)
+        self.t_last = 0.0
 
-    def on_pre_spike(self, i: int, t: float) -> np.ndarray:
+        # logging
+        self.last_dw_sum = 0.0
+
+    def decay_to(self, t):
+        dt = t - self.t_last
+        if dt > 0:
+            exp_decay_inplace(self.pre_trace, dt, self.tau_pre)
+            exp_decay_inplace(self.post_trace, dt, self.tau_post)
+            self.t_last = t
+
+    def on_pre_spike(self, pre_idx, t, x_t=1.0):
+        """Called when presynaptic neuron spikes (or receives analog input).
+           Returns vector of postsynaptic currents (length n_post)."""
         self.decay_to(t)
-        self.pre_trace.add(i, 1.0)
-        if self.learn:
-            y = self.post_trace.val  # latency-aware post activity
-            # Hebb (+) and Oja decay
-            # TODO: W = (1-y^2) W + A_plus * y -> is like like a moving avg over A_plus * y (VERIFY)
-            self.W[i, :] += self.A_plus * y - self.alpha * (y**2) * self.W[i, :]
-            self._dale_clip()
-        return self.W[i, :].copy()  # delivered current
+        self.pre_trace[pre_idx] += x_t
+        self.pre_last[pre_idx] = t
+        # postsynaptic current for each post neuron = sum_over_pre W[pre,post] * pre_trace[pre]
+        # efficient: vector multiply pre_trace @ W -> length n_post
+        return self.pre_trace @ self.W
 
-    def on_post_spike(self, j: int, t: float):
+    def on_post_spike(self, post_idx, t):
+        """Called when a postsynaptic neuron spikes (for learning trace)."""
         self.decay_to(t)
-        self.post_trace.add(j, 1.0)
-        if self.learn:
-            x = self.pre_trace.val
-            # TODO: this is equal to self.W[:, j] += -self.A_minus * x - self.alpha * (1**2) * self.W[:, j]
-            self.W[:, j] += -self.A_minus * x - self.alpha * (self.post_trace.val[j] ** 2) * self.W[:, j]
-            self._dale_clip()
+        self.post_trace[post_idx] += 1.0
+        self.post_last[post_idx] = t
 
-    def _dale_clip(self):
-        """Enforce Dale’s law by clipping weights to correct sign."""
-        for i in range(self.n_pre):
-            exc_rows = self.dale_signs > 0.0
-            inh_rows = ~exc_rows
-            if np.any(exc_rows):
-                self.W[exc_rows, :] = np.clip(self.W[exc_rows, :], 0.0, None)
-            if np.any(inh_rows):
-                self.W[inh_rows, :] = np.clip(self.W[inh_rows, :], None, 0.0)
+    def update(self, pre_idx, post_idx, reward=None, anti_hebb=False):
+        """Update single synapse W[pre_idx, post_idx]. Returns |dw| for logging."""
+        lr = float(self.eta)
+        if self.is_output and (reward is not None):
+            lr *= float(reward)*100
+            # lr *= 1
+        sign = -1.0 if anti_hebb else 1.0
+        dw = sign * lr * self.pre_trace[pre_idx] * self.post_trace[post_idx]
+        if self.oja:
+            dw -= lr * (self.post_trace[post_idx] ** 2) * self.W[pre_idx, post_idx]
+        self.W[pre_idx, post_idx] += dw
+        self.W[pre_idx, post_idx] = np.clip(self.W[pre_idx, post_idx], 0.0, 0.2)
+        self.last_dw_sum += abs(dw)
+        return abs(dw)
 
-    def reset(self):
-        self.pre_trace.val[:] = 0.0
-        self.pre_trace.t_last = 0.0
-        self.post_trace.val[:] = 0.0
-        self.post_trace.t_last = 0.0
+    def reset_dw_log(self):
+        val = self.last_dw_sum
+        self.last_dw_sum = 0.0
+        return val
 
+    def reset_traces(self):
+        self.pre_trace[:] = 0.0
+        self.post_trace[:] = 0.0
+        self.pre_last[:] = -1e9
+        self.post_last[:] = -1e9
+        self.t_last = 0.0
 
-# ---------------------------- Latency (time-to-first-spike) Encoder ----------------------------
-class LatencyEncoder:
-    """Map values in [0,1] to spike times in [t_offset + t_eps, t_offset + window].
-       Higher value -> earlier spike. Value<=0 -> no spike.
+# ---------------- LIF Population (PSC + membrane) ----------------
+class LIFPopulation:
     """
-    def __init__(self, window: float=20.0, t_eps: float=1e-3):
-        self.window = float(window)
-        self.t_eps = float(t_eps)
+    Event-driven LIF population with:
+      - PSC per neuron (i_syn) decaying with tau_syn
+      - membrane V decaying with tau_m
+      - compute_next_spike assumes i_syn stays constant (analytic crossing)
+      - local lateral inhibition (configurable radius & strength)
+      - continuous/homeostatic gain adaptation (rate estimate + gain_lr)
+    """
+    def __init__(self, n, tau_m=20.0, tau_syn=5.0, v_thresh=1.0, v_reset=0.0,
+                 refractory=0.0, inhib=0.1, name="pop",
+                 target_rate=0.05, gain_lr=1e-4, tau_homeo=1000.0,
+                 inh_strength=0.5, inh_radius=3):
+        self.name = name
+        self.n = int(n)
 
-    def encode(self, x: np.ndarray, t_offset: float=0.0) -> List[Tuple[float, int]]:
-        ev = []
-        w, te = self.window, self.t_eps
-        for i, v in enumerate(np.asarray(x, dtype=float)):
-            if v <= 0.0: continue
-            t = t_offset + te + (1.0 - v) * (w - te)
-            ev.append((t, i))
-        return ev
+        # time constants & thresholds
+        self.tau_m = float(tau_m)
+        self.tau_syn = float(tau_syn)
+        self.v_thresh = float(v_thresh)
+        self.v_reset = float(v_reset)
+        self.refractory = float(refractory)
 
-# ---------------------------- Network (global time) ----------------------------
-class DeepCausalSNN_Event:
-    def __init__(self, n_in: int, n_h1: int, n_h2: int, n_out: int, params: dict):
+        # divisive inhibition on incoming current
+        self.inhib = float(inhib)
 
-        # Populations
-        self.h1 = LIFPopulation(n_h1, tau_m = 40.0, v_thresh= 0.1, v_reset= 0.0, refractory=1.0, inhib=0.1, thr_adapt=0.1, thr_tau=30.0, name='h1')
-        self.h2 = LIFPopulation(n_h2, tau_m = 40.0, v_thresh= 0.1, v_reset= 0.0, refractory=1.0, inhib=0.1, thr_adapt=0.1, thr_tau=30.0, name='h2')
-        self.out = LIFPopulation(n_out, tau_m= 40.0, v_thresh= 0.1, v_reset=0.0, refractory=1.0, inhib=0.1, thr_adapt=0.1, thr_tau=30.0, name='out')
+        # states
+        self.v = np.zeros(self.n, dtype=float)        # membrane potential
+        self.i_syn = np.zeros(self.n, dtype=float)    # postsynaptic currents (PSC)
+        self.t_last_spike = -1e9 * np.ones(self.n, dtype=float)
 
-        # Synapses
-        #TODO: prevent synchronicity of neuron firing...
-        self.in_h1  = SynapseMatrix(n_in,  n_h1,  dale_ratio=1.0, g_exc=1.0, g_inh=0.2,  A_plus=0.03, A_minus=0.01, alpha=1e-4, name='in->h1')
-        self.h1_rec = SynapseMatrix(n_h1,  n_h1,  dale_ratio=0.8,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h1->h1')
-        self.h1_h2  = SynapseMatrix(n_h1,  n_h2,  dale_ratio=0.8,  g_exc=1.0, g_inh=0.3,  A_plus=0.02, A_minus=0.01, alpha=1e-4, name='h1->h2')
-        self.h2_rec = SynapseMatrix(n_h2,  n_h2,  dale_ratio=0.8,  g_exc=0.7, g_inh=0.7,  A_plus=0.01, A_minus=0.015,alpha=2e-4, name='h2->h2')
+        # multiplicative input gain (homeostatically adapted)
+        self.gain = np.ones(self.n, dtype=float)
+        self.gain_lr = float(gain_lr)
 
-        #TODO: include reward function
-        self.syn_h2out = SynapseMatrix(n_h2,  n_out, dale_ratio=1.0,  g_exc=1.0, g_inh=0.0,  A_plus=0.02, A_minus=0.0,  alpha=1e-4, name='h2->out')
+        # homeostasis / rate tracking
+        self.spike_count = np.zeros(self.n, dtype=float)
+        self.target_rate = float(target_rate)
+        self.rate_estimate = np.zeros(self.n, dtype=float)
+        self.tau_homeo = float(tau_homeo)  # time constant for rate averaging
+        # alpha_homeo used for discrete bump on spike (kept small)
+        self.alpha_homeo = 1.0 / max(1.0, float(tau_homeo))
 
-        # Encoders
-        self.enc_in  = LatencyEncoder(window=params['encoding_window'])
-        self.enc_out = LatencyEncoder(window=params['encoding_window'])
+        # local inhibition params
+        self.inh_strength = float(inh_strength)
+        self.inh_radius = int(inh_radius)
 
-        # Global clock
-        self.t_global = 0.0
-        self.vth_out = 0.1
-        self.sample_window = float(params.get('encoding_window', 20.0))
-        self.silent_gap = float(params.get('silent_gap', 0.0))  # idle time between samples
+        # time bookkeeping per neuron
+        self.t_last_update = np.zeros(self.n, dtype=float)
 
-        #avg losses
-        self.avg_latency_loss_per_epoch = []
-        self._epoch_losses = []
+    # ---------- decay states to time t ----------
+    def decay_to(self, t):
+        """
+        Exponentially decay v, i_syn, and rate_estimate from each neuron's last update time
+        to time t. This handles asynchronous event-driven progression.
+        """
+        dt = t - self.t_last_update
+        mask = dt > 0
+        if not np.any(mask):
+            return
+        dt_mask = dt[mask]
+        self.v[mask] *= np.exp(-dt_mask / self.tau_m)
+        self.i_syn[mask] *= np.exp(-dt_mask / self.tau_syn)
+        # decay rate estimate according to tau_homeo
+        self.rate_estimate[mask] *= np.exp(-dt_mask / self.tau_homeo)
+        # update last update times
+        self.t_last_update[mask] = t
 
-    def epoch_reset(self):
-        """Reset all time-dependent variables at epoch start; keep weights."""
-        self.t_global = 0.0
-        # Reset LIF neurons
-        [pop.reset() for pop in [self.h1, self.h2, self.out]]
-        # Reset synapse traces
-        [syn.reset() for syn in [self.in_h1, self.h1_rec, self.h1_h2, self.h2_rec, self.syn_h2out]]
+    # ---------- analytic spike time prediction ----------
+    def compute_next_spike(self, j, I_drive, t_now, V_before):
+        """
+        Predict next crossing time for neuron j assuming I_drive (PSC) stays constant.
+        Solves V(t) = V_inf + (V0 - V_inf)*exp(-(t-t_now)/tau_m) = V_thresh.
+        Returns absolute t_cross or None.
+        """
+        t_earliest = max(t_now, self.t_last_spike[j] + self.refractory)
 
+        V0 = V_before
+        Vth = self.v_thresh
+        V_inf = I_drive * self.tau_m  # steady-state voltage for constant current
 
+        # if steady-state below threshold, never cross
+        if V_inf <= Vth:
+            return None
 
-    # ---- core: process a stream of samples sequentially on the global clock ----
-    def run_stream(self, x_batch, y_batch, encoding_window=50.0, d_ax=0.5):
-        # Continuous event-driven run over a batch, using absolute global time.
-        B = len(x_batch)
-        evq = []
-        spikes = {"in": [], "h1": [], "h2": [], "out": [], "target": []}
-        # Encode all input + target spikes with absolute global time
-        for b, (x, y) in enumerate(zip(x_batch, y_batch)):
-            t_offset = b * encoding_window
-            in_spikes = self.enc_in.encode(x, t_offset)
-            target_spikes = self.enc_out.encode(y, t_offset)
-            for (t, i) in in_spikes:
-                heapq.heappush(evq, Event(t, 'in', i))
-            for (t, j) in target_spikes:
-                heapq.heappush(evq, Event(t, 'target', j))
+        # if already above threshold and not in refractory -> immediate spike
+        if V0 >= Vth and t_now >= t_earliest:
+            return t_now
 
-        # Variables to collect per-sample latencies
-        pending_out = {}
-        pending_tgt = {}
-        loss = []
+        denom = (V0 - V_inf)
+        num = (Vth - V_inf)
+        if denom == 0.0:
+            return None
+        ratio = num / denom
+        if ratio <= 0.0:
+            return None
 
-        while evq:
-            ev = heapq.heappop(evq)
-            # Update global time
-            self.t_global = ev.time
-            t = ev.time
-            # Decode sample index from global time
-            sample_idx = int(t // encoding_window)
-            # Decay to current global time
-            [e.decay_to(t) for e in [self.h1, self.h2, self.in_h1, self.h1_rec, self.h1_h2, self.h2_rec, self.syn_h2out]]
+        dt_cross = - self.tau_m * safe_log(ratio)
+        if not np.isfinite(dt_cross) or dt_cross < 0.0:
+            return None
 
-            # Handle event types
-            if ev.src == 'in':
-                spikes["in"].append((t, ev.idx))
-                I = self.in_h1.on_pre_spike(ev.idx, t)
-                #TODO: on_pre_spike(ev.idx, t, spikes['in']_trailing_count)
-                #TODO: trailing_count adjusts A
-                self.h1.receive_current(I)
+        t_cross = t_now + dt_cross
+        if t_cross < t_earliest:
+            return None
 
-            elif ev.src == 'h1':
-                spikes["h1"].append((t, ev.idx))
-                j = ev.idx
-                self.h1_rec.on_post_spike(j, t)
-                Irec = self.h1_rec.on_pre_spike(j, t)
-                self.h1.receive_current(Irec)
-                I12 = self.h1_h2.on_pre_spike(j, t)
-                self.h2.receive_current(I12)
+        return t_cross
 
-            elif ev.src == 'h2':
-                spikes["h2"].append((t, ev.idx))
-                k = ev.idx
-                self.h2_rec.on_post_spike(k, t)
-                Irec2 = self.h2_rec.on_pre_spike(k, t)
-                self.h2.receive_current(Irec2)
-                Iout = self.syn_h2out.on_pre_spike(ev.idx, t)
-                self.out.receive_current(Iout)
+    # ---------- receive incoming vector current (from synapses) ----------
+    def receive_current(self, I_vector, t_now):
+        """
+        I_vector: numpy array length n with instantaneous PSC additions (e.g. from on_pre_spike).
+        We:
+          - decay internal states to t_now
+          - apply divisive inhibition across the vector
+          - add scaled currents to i_syn (PSC)
+          - compute candidate crossing times for neurons not refractory
+        Returns list of (t_cross, neuron_idx)
+        """
+        self.decay_to(t_now)
+        I = np.asarray(I_vector, dtype=float)
+        if I.shape[0] != self.n:
+            raise ValueError("Input current length mismatch")
 
-            elif ev.src == 'target':
-                spikes["target"].append((t, ev.idx))
-                self.syn_h2out.on_post_spike(ev.idx, t)
-                if sample_idx not in pending_tgt:
-                    pending_tgt[sample_idx] = t
+        # optional divisive inhibition on the incoming vector (global competition)
+        I = I**1.5
+        total = np.sum(I)
+        if total > 0.0 and self.inhib > 0.0:
+            I = I / (1.0 + self.inhib * total)
 
-            # After delivering currents, check for new spikes
-            new_h1 = self.h1.threshold_spikes(t)
-            if new_h1 is not None and len(new_h1) > 0:
-                # optionally apply inhibition
-                for j in new_h1:
-                    spikes['h1'].append((self.t_global, int(j)))
-                    # d_ax = np.random.uniform(0.5, 2.0)  # ms
-                    heapq.heappush(evq, Event(self.t_global + d_ax, 'h1', int(j)))
+        events = []
+        for j in range(self.n):
+            if (t_now - self.t_last_spike[j]) < self.refractory:
+                continue
+            V_before = self.v[j]
+            # accumulate PSC (gain scales synaptic efficacy)
+            self.i_syn[j] += I[j] * self.gain[j]
+            # predict crossing using current i_syn (assumed constant forward)
+            t_cross = self.compute_next_spike(j, self.i_syn[j], t_now, V_before)
+            if t_cross is not None:
+                events.append((t_cross, j))
+        return events
 
-            new_h2 = self.h2.threshold_spikes(t)
-            if new_h2 is not None and len(new_h2) > 0:
-                for j in new_h2:
-                    spikes['h2'].append((self.t_global, int(j)))
-                    # d_ax = np.random.uniform(0.5, 2.0)  # ms
-                    heapq.heappush(evq, Event(self.t_global + d_ax, 'h2', int(j)))
+    # ---------- spike registration (called when a spike event occurs) ----------
+    def register_spike(self, j, t):
+        """
+        Reset membrane V, record spike time, apply local lateral inhibition,
+        update rate estimate and homeostatic gain for the spiking neuron.
+        """
+        # make sure states are decayed to t before applying instantaneous updates
+        self.decay_to(t)
 
-            new_out = self.out.threshold_spikes(t)
-            if new_out is not None and len(new_out) > 0:
-                for j in new_out:
-                    spikes["out"].append((self.t_global, int(j)))
-                    if sample_idx not in pending_out:
-                        pending_out[sample_idx] = t
-                    # d_ax = np.random.uniform(0.5, 2.0)  # ms
-                    heapq.heappush(evq, Event(self.t_global + d_ax, 'out', int(j)))
+        # reset membrane and bookkeeping
+        self.v[j] = self.v_reset
+        self.t_last_spike[j] = t
+        self.spike_count[j] += 1
 
-            # ---- Konfiguration (einmal zentral definieren) ----
+        # LOCAL lateral inhibition: only affect neighbors within inh_radius
+        for offset in range(-self.inh_radius, self.inh_radius + 1):
+            k = j + offset
+            if 0 <= k < self.n and k != j:
+                # subtract from membrane to transiently delay neighbors
+                self.v[k] -= self.inh_strength
 
-            T_MAX = encoding_window  # oder der Wert/Counter deiner Simulationslänge
-            PENALTY_TIME = T_MAX / 2.0  # Fallback-Zeitaufschlag bei "kein Spike"
-            EXTRA_SPIKE_PENALTY = 1.0  # Strafe pro zusätzlichem Spike (tune nach Bedarf)
+        # HOMEOSTASIS / rate estimate update:
+        # (we decayed rate_estimate in decay_to above so it's up-to-date)
+        # add a small bump for this spike (alpha_homeo chosen ~ 1/tau_homeo)
+        self.rate_estimate[j] += self.alpha_homeo
 
-            # --- Loss computation (latency-based) ---
-            if sample_idx in pending_tgt:  # Target muss vorhanden sein
-                # 1) Outputzeiten robust aus pending_out holen
-                if sample_idx in pending_out:
-                    raw = pending_out[sample_idx]
-                else:
-                    raw = None  # kein Eintrag => kein Spike
+        # adjust gain (can be vectorized; only j changed but we keep simple)
+        # gain moves slowly toward keeping rate_estimate ~ target_rate
+        self.gain += self.gain_lr * (self.target_rate - self.rate_estimate)
+        # clamp gains to prevent runaway
+        self.gain = np.clip(self.gain, 0.1, 10.0)
 
-                # raw kann None, ein Skalar (float), oder eine Liste/Sequenz von Spikezeiten sein
-                if raw is None:
-                    spike_times = []
-                elif isinstance(raw, (list, tuple)):
-                    # nur echte Zeiten (nicht-None) und sortiert (falls nicht schon)
-                    spike_times = sorted([t for t in raw if t is not None])
-                else:
-                    # einzelner Skalar
-                    spike_times = [] if raw is None else [raw]
+    def is_spike_valid(self, j, t):
+        return (t - self.t_last_spike[j]) >= self.refractory
 
-                # 2) Latenz-Zeit bestimmen + Rate-Strafe bei Mehrfachspikes
-                if len(spike_times) == 0:
-                    # kein Spike
-                    t_out = T_MAX + PENALTY_TIME
-                    rate_pen = 0.0
-                else:
-                    # nimm erste Spikezeit für Latenz
-                    t_out = spike_times[0]
-                    # zusätzliche Spikes bestrafen
-                    extra_spikes = max(0, len(spike_times) - 1)
-                    rate_pen = EXTRA_SPIKE_PENALTY * float(extra_spikes)
+    # ---------- housekeeping ----------
+    def reset_spike_flags(self):
+        self.spike_count[:] = 0.0
 
-                # 3) Latenz-Loss + Rate-Loss kombinieren
-                t_tgt = pending_tgt[sample_idx]
-                latency_loss = (t_out - t_tgt) ** 2
-                total_loss = latency_loss + rate_pen
+    def state_reset(self):
+        self.v[:] = 0.0
+        self.i_syn[:] = 0.0
+        self.t_last_spike[:] = -1e9
+        self.t_last_update[:] = 0.0
+        self.spike_count[:] = 0.0
+        self.rate_estimate[:] = 0.0
+        self.gain[:] = 1.0
 
-                # optional: logge beide Anteile getrennt, falls du das möchtest
-                # loss.append((self.t_global, {"latency": latency_loss, "rate": rate_pen, "total": total_loss}))
+# ---------------- Simulation / Training ----------------
+def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
+    """
+    Single epoch over dataset X, Y_target (shape T x n_in, T x n_out).
+    Returns spikes dict and epoch_loss (sum of sample losses).
+    """
+    T = X.shape[0]
+    n_in = X.shape[1]
+    evq = []
+    spikes = {"in": [], "h1": [], "h2": [], "out": [], "tgt": []}
+    epoch_loss = 0.0
 
-                loss.append((self.t_global, total_loss))
+    # preload input events (one event per input neuron per sample time)
+    for t_idx in range(T):
+        t_ev = t_idx * encoding_window
+        for j in range(n_in):
+            heapq.heappush(evq, Event(time=float(t_ev), src="in", idx=int(j)))
 
-                # 4) Aufräumen
-                if sample_idx in pending_out:
-                    del pending_out[sample_idx]
-                del pending_tgt[sample_idx]
+    I_to_h1_reg = []
+    # process event queue
+    while evq:
+        ev = heapq.heappop(evq)
+        t = ev.time
+        sample_idx = min(int(t // encoding_window), T - 1)
 
-        return spikes, loss
+        # INPUT pre-spike
+        if ev.src == "in":
+            x_t = float(X[sample_idx, ev.idx])
+            spikes["in"].append((t, ev.idx, x_t))
+            # update presyn trace and get postsyn currents
+            I_to_h1 = W_in_h1.on_pre_spike(ev.idx, t, x_t)    # length n_h1
+            I_to_h1_reg.append(I_to_h1)
+            # deliver currents to h1 (accumulate PSCs) and schedule predicted spikes
+            new_events = h1.receive_current(I_to_h1, t)
+            for (t_cross, j) in new_events:
+                heapq.heappush(evq, Event(time=float(t_cross), src="h1", idx=int(j)))
 
-# ---------------------------- Main ----------------------------
-if __name__ == "__main__":
-    np.random.seed(7)
-    n_epochs, B = 5, 10
-    N_IN, N_OUT = 2, 1
-    t_max_per_sample = 50
-    params = {"n_h1": 80, "n_h2": 60, "encoding_window": t_max_per_sample}
+        # H1 post-spike
+        elif ev.src == "h1":
+            j = ev.idx
+            # TODO: is this needed?
+            if not h1.is_spike_valid(j, t):
+                continue
+            # register spike
+            h1.register_spike(j, t)
+            spikes["h1"].append((t, j, 1.0))
+            # learning: update pre/post traces at synapse
+            W_in_h1.on_post_spike(j, t)
+            # update input->h1 weights: for each pre_idx decide anti_hebb by comparing last times
+            for pre_idx in range(W_in_h1.W.shape[0]):
+                pre_t = W_in_h1.pre_last[pre_idx]
+                post_t = W_in_h1.post_last[j]
+                anti = (pre_t > post_t)   # if pre happened after post => anti-Hebbian
+                W_in_h1.update(pre_idx, j, reward=None, anti_hebb=anti)
+            # propagate to h2
+            I_to_h2 = W_h1_h2.on_pre_spike(j, t, 1.0)   # amplitude 1.0 from hidden spike
+            new_events = h2.receive_current(I_to_h2, t)
+            for (t_cross, k) in new_events:
+                heapq.heappush(evq, Event(time=float(t_cross), src="h2", idx=int(k)))
 
-    # Generate deterministic mapping
-    x = np.random.rand(B, N_IN)
-    r = (x[:,0]-.5) ** 2 + (x[:,1]-.5) ** 2
-    y = np.expand_dims((1 - r) * np.exp(-r /2),1)
-    # fig = plt.figure()
-    # ax = fig.add_subplot(111, projection='3d')
-    # ax.scatter(x[:, 0], x[:, 1], y[:, 0], c=y[:, 0], cmap='viridis', s=50)
-    # plt.show(block=True)
+        # H2 post-spike -> output & learning
+        elif ev.src == "h2":
+            k = ev.idx
+            # TODO: needed?
+            if not h2.is_spike_valid(k, t):
+                continue
+            h2.register_spike(k, t)
+            spikes["h2"].append((t, k, 1.0))
+            # learning h1->h2
+            W_h1_h2.on_post_spike(k, t)
+            for pre_idx in range(W_h1_h2.W.shape[0]):
+                pre_t = W_h1_h2.pre_last[pre_idx]
+                post_t = W_h1_h2.post_last[k]
+                anti = (pre_t > post_t)
+                W_h1_h2.update(pre_idx, k, reward=None, anti_hebb=anti)
 
-    all_losses = []
-    model = DeepCausalSNN_Event(N_IN, params["n_h1"], params["n_h2"], N_OUT, params)
-    for epoch in range(n_epochs):
-        print(epoch)
-        model.epoch_reset()
-        spikes, loss = model.run_stream(x, y, t_max_per_sample, d_ax=0.05)
-        times, losses = zip(*loss) if loss else ([], [])
-        all_losses.append((epoch, times, losses))
+            # forward to output
+            I_out = W_h2_out.on_pre_spike(k, t, 1.0)  # length n_out
+            for m, val in enumerate(I_out):
+                if val > 0:
+                    spikes["out"].append((t, m, float(val)))
+            # target (for this sample)
+            tgt = np.asarray(Y_target[sample_idx], dtype=float)
+            for m, val in enumerate(tgt):
+                if val > 0:
+                    spikes["tgt"].append((t, m, float(val)))
 
-    plt.figure(figsize=(8, 5))
-    epoch_loss = np.array([np.mean(l) for _, _, l in all_losses])
-    plt.plot(range(n_epochs),epoch_loss , marker='o', linestyle='-')
+            # learning at output: for each post-output neuron that has current
+            #TODO 1:1 comparison + remove square
+            reward = float(np.exp(-np.sum((I_out - tgt) ** 2)))
+            for post_idx in range(W_h2_out.W.shape[1]):
+                if I_out[post_idx] <= 0.0:
+                    continue
+                W_h2_out.on_post_spike(post_idx, t)
+                for pre_idx in range(W_h2_out.W.shape[0]):
+                    # anti-hebb decision same way (optional)
+                    pre_t = W_h2_out.pre_last[pre_idx]
+                    post_t = W_h2_out.post_last[post_idx]
+                    anti = (pre_t > post_t)
+                    W_h2_out.update(pre_idx, post_idx, reward=reward, anti_hebb=anti)
+
+            # supervised loss accumulation (MSE)
+            epoch_loss += np.sum((I_out - tgt) ** 2)
+
+    # print(I_to_h1_reg)
+    return spikes, epoch_loss
+
+# ---------------- Training wrapper ----------------
+def train(epochs=10, T=30, encoding_window=10.0, seed=None):
+    rng = np.random.default_rng(seed)
+    n_in = 3
+    n_out = 4
+    # create dataset once (persist across epochs)
+    X = rng.random((T, n_in))
+    Y_target = rng.random((T, n_out))
+    Y_target[Y_target < 0.5] = 0
+    # instantiate nets and synapses (weights persist across epochs)
+    h1 = LIFPopulation(5, tau_m=50.0, tau_syn=10.0, v_thresh=1.0, v_reset=0.0, refractory=15.0, inhib=1.0, name="h1")
+    h2 = LIFPopulation(4, tau_m=50.0, tau_syn=10.0, v_thresh=1.0, v_reset=0.0, refractory=15.0, inhib=1.0, name="h2")
+
+    W_in_h1 = SynapseMatrix(n_in, h1.n, eta=1e-4, tau_pre=5.0, tau_post=20.0, oja=False, seed=1)
+    W_h1_h2 = SynapseMatrix(h1.n, h2.n, eta=1e-4, tau_pre=5.0, tau_post=50.0, oja=False, seed=2)
+    W_h2_out = SynapseMatrix(h2.n, n_out, eta=1e-4, tau_pre=5.0, tau_post=50.0, oja=False, is_output=True, seed=3)
+    for l in (W_in_h1, W_h1_h2, W_h2_out):
+        l.W *= 0.05
+    W_h2_out.W *= 0.01  # additional output scaling
+
+    hebb_log = []
+    loss_log = []
+    last_spikes = None
+
+    for ep in range(epochs):
+        spikes, epoch_loss = run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out)
+        last_spikes = spikes
+        # reset membrane potentials
+        h1.state_reset(), h2.state_reset(), W_in_h1.reset_traces(), W_h1_h2.reset_traces(), W_h2_out.reset_traces()
+        # record simple Hebbian proxy: total abs weight change accumulated
+        hebb_proxy = W_in_h1.reset_dw_log() + W_h1_h2.reset_dw_log()
+        hebb_log.append(hebb_proxy)
+        loss_log.append(epoch_loss / float(max(1, T)))
+        print(f"Epoch {ep+1}/{epochs}: Hebb-proxy={hebb_proxy:.6e}, Loss={loss_log[-1]:.6e}")
+
+    return last_spikes, hebb_log, loss_log
+
+# ---------------- Plotting ----------------
+def plot_progress_and_raster(spikes, hebb_log, loss_log):
+    plt.figure(figsize=(12,5))
+    plt.subplot(1,2,1)
+    plt.plot(hebb_log, label="Hidden Hebb proxy (|ΔW| sum)")
+    plt.plot(loss_log, label="Output loss (MSE)")
     plt.xlabel("Epoch")
-    plt.ylabel("Durchschnittlicher Latency Loss")
-    plt.title("Verlauf des durchschnittlichen Latency Loss pro Epoche")
-    plt.grid(True)
+    plt.legend()
+    plt.title("Learning curves")
 
+    plt.subplot(1,2,2)
+    offsets = {"in":0, "h1":6, "h2":12, "out":18, "tgt":24}
+    colors = {"in":"tab:blue", "h1":"tab:green", "h2":"tab:orange", "out":"tab:red", "tgt":"tab:purple"}
+    labels_done = set()
+    for key in ["in","h1","h2","out","tgt"]:
+        events = spikes.get(key, [])
+        for (t, idx, amp) in events:
+            label = key if key not in labels_done else None
+            plt.scatter(t, idx + offsets[key], s=max(6, amp*30), c=colors[key], label=label, alpha=0.7)
+            if label is not None:
+                labels_done.add(key)
+    plt.yticks([])
+    plt.xlabel("Time")
+    plt.title("Raster (last epoch)")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
-
-    # ---------------------------- Raster Plot with Sample Boundaries ----------------------------
-    def plot_spikes_raster(spikes, t_max_per_sample, n_samples, layer_order=None):
-        if layer_order is None:
-            layer_order = ["in", "h1", "h2", "out", "target"]
-
-        fig, axes = plt.subplots(len(layer_order)+1, 1, sharex=True, figsize=(10, 8))
-        for ax, key in zip(axes, layer_order):
-            data = spikes[key]
-            if data:
-                t, n = zip(*data)
-                ax.scatter(t, n, s=10, marker="|")
-            ax.set_ylabel(key)
-            ax.grid(True, linestyle="--", alpha=0.3)
-
-            # Draw sample boundaries
-            for s in range(1, n_samples):
-                ax.axvline(s * t_max_per_sample, color="red", linestyle="--", alpha=0.5)
-
-        axes[-1].set_xlabel("Global Time")
-
-        if all_losses is not None:
-            ax = axes[-1]
-            times, losses = all_losses[0][1], all_losses[0][2]
-            ax.plot(times, losses, label='first epoch')
-            times, losses = all_losses[-1][1], all_losses[-1][2]
-            ax.plot(times, losses, label='last epoch')
-            # for epoch, times, losses in all_losses:
-            #     if times and losses:
-            #         ax.plot(times, losses, label=f"Epoch {epoch}")
-            ax.set_ylabel("Latency loss")
-            ax.set_xlabel("Global time")
-            ax.legend()
-            ax.grid(True, linestyle="--", alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-
-    plot_spikes_raster(spikes, t_max_per_sample, B)
-
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    spikes, hebb_log, loss_log = train(epochs=100, T=40, encoding_window=10.0, seed=0)
+    plot_progress_and_raster(spikes, hebb_log, loss_log)

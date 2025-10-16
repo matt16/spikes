@@ -2,9 +2,6 @@ import numpy as np
 import heapq
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
-import pandas as pd
-from pathlib import Path
-
 
 # ---------------- Event ----------------
 @dataclass(order=True)
@@ -293,113 +290,12 @@ class LIFPopulation:
         self.rate_estimate[:] = 0.0
         self.gain[:] = 1.0
 
-
-
-#----------get financial data----------
-def load_timeseries_from_csv(
-    csv_path: str,
-    T: int,
-    take_last: bool = False,
-    fillna_value: float = 0.0,
-    index_order=None,
-) -> np.ndarray:
-    """
-    Lädt das Weekly-Returns-CSV (4 Reihen = Indizes, Spalten = Wochen) und liefert X mit Shape (T, 4).
-
-    Args:
-        csv_path: Pfad zur CSV (Zeilen = Indizes, Spalten = Wochen-Datumsstrings).
-        T: Anzahl Wochen, die du als Zeitfenster willst.
-        take_last: False -> erste T Wochen; True -> letzte T Wochen.
-        fillna_value: Wert zum Füllen fehlender Einträge (z. B. 0.0).
-        index_order: Optionale Liste mit genau 4 gewünschten Indexnamen (Reihenfolge im Output).
-
-    Returns:
-        X: np.ndarray der Form (T, 4) — Spalten entsprechen der finalen Index-Reihenfolge.
-    """
-    p = Path(csv_path)
-    if not p.exists():
-        raise FileNotFoundError(f"CSV nicht gefunden: {p}")
-
-    df = pd.read_csv(p, index_col=0)
-
-    # --- Spalten (Wochen) chronologisch sortieren ---
-    # Falls Spalten Datumsstrings sind, werden sie in Datumswerte geparst und sortiert.
-    cols = pd.Index(df.columns)
-    cols_dt = pd.to_datetime(cols, errors="coerce", utc=False)
-    if not cols_dt.isna().all():
-        # NaT ans Ende sortieren
-        order = pd.Series(cols_dt).fillna(pd.Timestamp.max).argsort(kind="mergesort")
-        df = df.iloc[:, order]
-        cols_dt_sorted = cols_dt[order]
-        # Einheitliche ISO-Labels (YYYY-MM-DD) für datums-parsbare Spalten
-        new_cols = [
-            d.strftime("%Y-%m-%d") if pd.notna(d) else str(df.columns[i])
-            for i, d in enumerate(cols_dt_sorted)
-        ]
-        df.columns = new_cols
-
-    # --- Reihenfolge der vier Indizes bestimmen ---
-    def norm(s: str) -> str:
-        return "".join(ch for ch in str(s).lower() if ch.isalnum())
-
-    if index_order is None:
-        desired = ["S&P500", "EuroStoxx50", "Nikkei225", "FTSE100"]
-    else:
-        if len(index_order) != 4:
-            raise ValueError("index_order muss genau 4 Namen enthalten.")
-        desired = list(index_order)
-
-    existing_norm_map = {norm(idx): idx for idx in df.index}
-    picked = []
-    for name in desired:
-        key = norm(name)
-        if key in existing_norm_map:
-            picked.append(existing_norm_map[key])
-
-    if len(picked) == 4:
-        df = df.loc[picked]
-    else:
-        # Fallback: falls der CSV-Index bereits genau 4 Reihen hat, verwende diese Reihenfolge.
-        if df.shape[0] == 4:
-            pass  # nichts tun
-        else:
-            raise ValueError(
-                "Konnte die vier gewünschten Indizes nicht robust zuordnen.\n"
-                f"CSV-Reihen gefunden: {list(df.index)}\n"
-                f"Gewünschte (oder Default) Reihenfolge: {desired}"
-            )
-
-    # --- Sanity-Checks & Spaltenauswahl ---
-    if df.shape[0] != 4:
-        raise ValueError(f"CSV sollte 4 Reihen haben (Indizes). Gefunden: {df.shape[0]}")
-    if T > df.shape[1]:
-        raise ValueError(f"T={T} > verfügbare Wochen={df.shape[1]} in Datei '{p.name}'.")
-
-    df_T = df.iloc[:, -T:] if take_last else df.iloc[:, :T]
-
-    # --- Numerisch coercen & fehlende füllen ---
-    df_T = df_T.apply(pd.to_numeric, errors="coerce").astype(float)
-    if fillna_value is not None:
-        df_T = df_T.fillna(fillna_value)
-
-    # --- (4, T) -> (T, 4) ---
-    X = df_T.T.to_numpy(dtype=float)
-    if X.shape != (T, 4):
-        raise RuntimeError(f"Unerwartete Shape {X.shape}; erwartet {(T, 4)}.")
-    return X
-
-
-
-
-
-
 # ---------------- Simulation / Training ----------------
 def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
     """
     Single epoch over dataset X, Y_target (shape T x n_in, T x n_out).
     Returns spikes dict and epoch_loss (sum of sample losses).
     """
-
     T = X.shape[0]
     n_in = X.shape[1]
     evq = []
@@ -407,6 +303,7 @@ def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
     epoch_loss = 0.0
 
     # --- PRELOAD INPUT EVENTS: Basic Latency Encoder ---
+    # Ersetzt deinen bisherigen "one event per input neuron per sample time"-Block
     for t_idx in range(T):
         t0 = float(t_idx * encoding_window)
         row = X[t_idx]  # shape: (n_in,)
@@ -423,10 +320,12 @@ def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
         for j in range(n_in):
             # hoher Wert → früherer Spike im Fenster [t0, t0 + encoding_window]
             t_spike = t0 + (1.0 - float(x01[j])) * encoding_window
+
             # Basic: amplitude = 1.0
             # Falls du das Vorzeichen der Rohwerte mitgeben willst:
             # amp = float(np.sign(row[j])) if row[j] != 0 else 0.0
             heapq.heappush(evq, Event(time=float(t_spike), src="in", idx=int(j)))
+
 
 
     I_to_h1_reg = []
@@ -520,15 +419,12 @@ def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
 # ---------------- Training wrapper ----------------
 def train(epochs=10, T=30, encoding_window=10.0, seed=None):
     rng = np.random.default_rng(seed)
-    n_in = 4
-    n_out = 4
+    n_in = 3
+    n_out = 2
     # create dataset once (persist across epochs)
-    X = load_timeseries_from_csv(csv_path="weekly_returns.csv", T=T, take_last=False)
-
-    Y_target = X.copy()
-    Y_target[Y_target < 2.0] = 0
+    X = rng.random((T, n_in))
+    Y_target = rng.random((T, n_out))
     print(X)
-
     # instantiate nets and synapses (weights persist across epochs)
     h1 = LIFPopulation(5, tau_m=50.0, tau_syn=10.0, v_thresh=1.0, v_reset=0.0, refractory=2.0, inhib=0.0, name="h1")
     h2 = LIFPopulation(4, tau_m=50.0, tau_syn=10.0, v_thresh=1.0, v_reset=0.0, refractory=2.0, inhib=0.0, name="h2")
@@ -545,7 +441,6 @@ def train(epochs=10, T=30, encoding_window=10.0, seed=None):
     last_spikes = None
 
     for ep in range(epochs):
-
         spikes, epoch_loss = run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out)
         last_spikes = spikes
         # reset membrane potentials
@@ -588,5 +483,5 @@ def plot_progress_and_raster(spikes, hebb_log, loss_log):
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
-    spikes, hebb_log, loss_log = train(epochs=100, T=40, encoding_window=10.0, seed=0)
+    spikes, hebb_log, loss_log = train(epochs=5, T=40, encoding_window=10.0, seed=0)
     plot_progress_and_raster(spikes, hebb_log, loss_log)

@@ -78,7 +78,6 @@ class SynapseMatrix:
         lr = float(self.eta)
         if self.is_output and (reward is not None):
             lr *= float(reward)
-            print('reward', reward, 'pre', pre_idx, 'post', post_idx)
             # lr *= 1
         sign = -1.0 if anti_hebb else 1.0
         dw = sign * lr * self.pre_trace[pre_idx] * self.post_trace[post_idx]
@@ -303,31 +302,43 @@ def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
     spikes = {"in": [], "h1": [], "h2": [], "out": [], "tgt": []}
     epoch_loss = 0.0
 
-    # --- PRELOAD INPUT EVENTS: Basic Latency Encoder ---
-    # Ersetzt deinen bisherigen "one event per input neuron per sample time"-Block
+    # --- PRELOAD INPUT EVENTS: Paper-style Poisson Encoder (positive stream only) ---
+
+    # Hyperparameters from the paper's scheme (tune as needed)
+    new_mean = 0.4  # baseline firing tendency; higher -> more baseline spikes
+    new_stdev = 0.9  # sensitivity around the mean; higher -> more contrast
+    rate_scale = 1.0  # expected spikes per window when normalized value == 1.0
+
+    rng = np.random.default_rng()
+
+    # 1) Paper-style normalization (no min-max; global per feature), negatives clipped to 0
+    def paper_normalize(arr, new_mean, new_stdev):
+        # arr: shape (T, n_in) with your positive input features
+        mu = np.mean(arr, axis=0, keepdims=True)  # per-feature mean over the whole run
+        sd = np.std(arr, axis=0, keepdims=True) + 1e-12  # per-feature std (avoid div-by-zero)
+        z = ((arr - mu) / sd) * new_stdev + new_mean  # shift & scale
+        return np.clip(z, 0.0, None)  # Poisson rate must be >= 0
+
+    # Compute normalized nonnegative intensities once for the whole sequence
+    Z = paper_normalize(X.astype(float), new_mean, new_stdev)  # shape (T, n_in), values in [0, ∞)
+
+    # 2) Poisson-sample spike counts per window and scatter spike times uniformly within the window
     for t_idx in range(T):
         t0 = float(t_idx * encoding_window)
-        row = X[t_idx]  # shape: (n_in,)
-        # robuste Normalisierung auf [0,1] pro Zeitschritt
-        vmin = float(np.min(row))
-        vmax = float(np.max(row))
-        if vmax == vmin:
-            # alle Werte gleich → alle feuern mittig im Fenster
-            t_mid = t0 + 0.5 * encoding_window
-            for j in range(n_in):
-                heapq.heappush(evq, Event(time=t_mid, src="in", idx=int(j)))
-            continue
-        x01 = (row - vmin) / (vmax - vmin)  # in [0,1]
+
+        # Expected spike count per neuron for this window (homogeneous Poisson)
+        lam = Z[t_idx] * rate_scale  # shape (n_in,)
+
         for j in range(n_in):
-            # hoher Wert → früherer Spike im Fenster [t0, t0 + encoding_window]
-            t_spike = t0 + (1.0 - float(x01[j])) * encoding_window
+            k = int(rng.poisson(lam[j]))  # number of spikes this window
+            if k <= 0:
+                continue
 
-            # Basic: amplitude = 1.0
-            # Falls du das Vorzeichen der Rohwerte mitgeben willst:
-            # amp = float(np.sign(row[j])) if row[j] != 0 else 0.0
-            heapq.heappush(evq, Event(time=float(t_spike), src="in", idx=int(j)))
-
-
+            # Uniform spike times inside [t0, t0 + encoding_window)
+            ts = t0 + rng.random(k) * encoding_window
+            for t_spike in ts:
+                heapq.heappush(evq, Event(time=float(t_spike), src="in", idx=int(j)))
+                # If your Event supports amplitudes and you want to encode sign separately, you could add amp=...
 
     I_to_h1_reg = []
     # process event queue
@@ -399,21 +410,17 @@ def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
                     spikes["tgt"].append((t, m, float(val)))
 
             # learning at output: for each post-output neuron that has current
-            beta = 1.0
-            err = (I_out - tgt)  # shape: (n_out,)
-            reward_vec = np.exp(-beta * (err ** 2))  # shape: (n_out,)
+            reward = float(np.exp(-np.sum((I_out - tgt) ** 2)))
             for post_idx in range(W_h2_out.W.shape[1]):
                 if I_out[post_idx] <= 0.0:
                     continue
                 W_h2_out.on_post_spike(post_idx, t)
-
-                r = float(reward_vec[post_idx])
-
                 for pre_idx in range(W_h2_out.W.shape[0]):
+                    # anti-hebb decision same way (optional)
                     pre_t = W_h2_out.pre_last[pre_idx]
                     post_t = W_h2_out.post_last[post_idx]
                     anti = (pre_t > post_t)
-                    W_h2_out.update(pre_idx, post_idx, reward=r, anti_hebb=anti)
+                    W_h2_out.update(pre_idx, post_idx, reward=reward, anti_hebb=anti)
 
             # supervised loss accumulation (MSE)
             epoch_loss += np.sum((I_out - tgt) ** 2)
@@ -425,11 +432,11 @@ def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2, W_h2_out):
 def train(epochs=10, T=30, encoding_window=10.0, seed=None):
     rng = np.random.default_rng(seed)
     n_in = 3
-    n_out = 4
+    n_out = 2
     # create dataset once (persist across epochs)
     X = rng.random((T, n_in))
     Y_target = rng.random((T, n_out))
-
+    print(X)
     # instantiate nets and synapses (weights persist across epochs)
     h1 = LIFPopulation(5, tau_m=50.0, tau_syn=10.0, v_thresh=1.0, v_reset=0.0, refractory=2.0, inhib=0.0, name="h1")
     h2 = LIFPopulation(4, tau_m=50.0, tau_syn=10.0, v_thresh=1.0, v_reset=0.0, refractory=2.0, inhib=0.0, name="h2")
@@ -488,5 +495,5 @@ def plot_progress_and_raster(spikes, hebb_log, loss_log):
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
-    spikes, hebb_log, loss_log = train(epochs=100, T=40, encoding_window=10.0, seed=0)
+    spikes, hebb_log, loss_log = train(epochs=5, T=40, encoding_window=10.0, seed=0)
     plot_progress_and_raster(spikes, hebb_log, loss_log)

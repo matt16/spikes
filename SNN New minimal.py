@@ -286,7 +286,7 @@ class LIFPopulation:
             return None
 
         # Debug print similar to original (optional)
-        print(f"[{self.name}] neuron {j} at t={t_now:.3f}: V0={V0:.4f}, I0={I0:.4f}, dend_tau={self.dend_tau[j]:.3f}, t_cross={t_cross:.4f}")
+        #print(f"[{self.name}] neuron {j} at t={t_now:.3f}: V0={V0:.4f}, I0={I0:.4f}, dend_tau={self.dend_tau[j]:.3f}, t_cross={t_cross:.4f}")
         return t_cross
 
     def receive_current(self, I_vector, t_now):
@@ -412,7 +412,6 @@ def run_epoch(X, Y_target, encoding_window, h1, W_in_h1):
         if (t % encoding_window) == 0:
             h1.update_homeostasis(encoding_window)
 
-    print(I_to_h1_reg)
 
     return spikes, epoch_loss
 
@@ -427,11 +426,13 @@ def train(epochs=10, T=30, encoding_window=10.0, seed=None):
 
     # instantiate nets and synapses (weights persist across epochs)
     # Here we set different initial dendritic taus for demonstration
-    h1 = LIFPopulation(5, tau_m=50.0, v_thresh=0.5, v_reset=0.0, refractory=2.0, inhib=0.0,
+    h1 = LIFPopulation(3, tau_m=50.0, v_thresh=0.5, v_reset=0.0, refractory=2.0, inhib=0.0,
                        name="h1", init_dend_tau=8.0, init_dend_gain=1.0)
 
-    v = 0.5
+    # HIER LIEGT DER HUND BEGRABEN
+    v = 0.001
     W_np = (np.eye(n_in, h1.n) * v).astype(float)
+    print(W_np)
     #W_np = np.full((n_in, h1.n), v, dtype=float)
     W_in_h1 = NewSynapseMatrix(W_np, tau_pre=20.0, tau_post=50.0)
 
@@ -445,7 +446,7 @@ def train(epochs=10, T=30, encoding_window=10.0, seed=None):
         # reset membrane potentials
         h1.state_reset()      # record simple Hebbian proxy: total abs weight change accumulated
         loss_log.append(epoch_loss / float(max(1, T)))
-        print(f"Epoch {ep+1}/{epochs}:  Loss={loss_log[-1]:.6e}")
+        #print(f"Epoch {ep+1}/{epochs}:  Loss={loss_log[-1]:.6e}")
 
     return last_spikes, loss_log
 

@@ -27,10 +27,10 @@ class NewSynapseMatrix:
       - on_pre_spike() gibt pre_trace @ W zurück (PSC-Summe über alle Prä-Spuren)
       - update() ist NO-OP (keine Lern-Änderung der Gewichte)
     """
-    def __init__(self, W_np, tau_pre=20.0, tau_post=50.0):
-        W_np = np.asarray(W_np, dtype=float)              # shape: (n_pre, n_post)
-        self.W = W_np
-        self.n_pre, self.n_post = W_np.shape
+    def __init__(self, W_mat, tau_pre=20.0, tau_post=50.0):
+        W = np.asarray(W_mat, dtype=float)              # shape: (n_pre, n_post)
+        self.W = W
+        self.n_pre, self.n_post = W.shape
         self.tau_pre = float(tau_pre)
         self.tau_post = float(tau_post)
 
@@ -356,7 +356,7 @@ class LIFPopulation:
 
 
 # ---------------- Simulation / Training ----------------
-def run_epoch(X, Y_target, encoding_window, h1, W_in_h1):
+def run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2):
     """
     Single epoch over dataset X, Y_target (shape T x n_in, T x n_out).
     Returns spikes dict and epoch_loss (sum of sample losses).
@@ -364,7 +364,7 @@ def run_epoch(X, Y_target, encoding_window, h1, W_in_h1):
     T = X.shape[0]
     n_in = X.shape[1]
     evq = []
-    spikes = {"in": [], "h1": [], "tgt": []}
+    spikes = {"in": [], "h1": [],"h2": [], "tgt": []}
     epoch_loss = 0.0
 
     # preload input events (one event per input neuron per sample time)
@@ -407,12 +407,30 @@ def run_epoch(X, Y_target, encoding_window, h1, W_in_h1):
                 if val > 0:
                     spikes["tgt"].append((t, m, float(val)))
 
+            # propagate to h2
+            # update presyn trace and get postsyn currents
+            I_to_h2 = W_h1_h2.on_pre_spike(j, t, 1.0)  # amplitude 1.0 from hidden spike
+            new_events = h2.receive_current(I_to_h2, t)
+            for (t_cross, k) in new_events:
+                heapq.heappush(evq, Event(time=float(t_cross), src="h2", idx=int(k)))
+
+
+        # H2 post-spike -> output & learning
+        elif ev.src == "h2":
+            k = ev.idx
+            # TODO: needed?
+            if not h2.is_spike_valid(k, t):
+                continue
+            h2.register_spike(k, t)
+            spikes["h2"].append((t, k, 1.0))
+
 
         # housekeeping at encoding window boundaries (optional)
         if (t % encoding_window) == 0:
             h1.update_homeostasis(encoding_window)
 
 
+    print(spikes["h2"])
     return spikes, epoch_loss
 
 # ---------------- Training wrapper ----------------
@@ -426,25 +444,33 @@ def train(epochs=10, T=30, encoding_window=10.0, seed=None):
 
     # instantiate nets and synapses (weights persist across epochs)
     # Here we set different initial dendritic taus for demonstration
-    h1 = LIFPopulation(5, tau_m=50.0, v_thresh=0.5, v_reset=0.0, refractory=2.0, inhib=0.0,
+    h1 = LIFPopulation(3, tau_m=50.0, v_thresh=0.5, v_reset=0.0, refractory=2.0, inhib=0.0,
                        name="h1", init_dend_tau=8.0, init_dend_gain=1.0)
+    h2 = LIFPopulation(3, tau_m=50.0, v_thresh=0.5, v_reset=0.0, refractory=2.0, inhib=0.0,
+                       name="h1", init_dend_tau=9.0, init_dend_gain=1.0)
 
     # HIER LIEGT DER HUND BEGRABEN
     v = 0.0005
     W_np = (np.eye(n_in, h1.n) * v).astype(float)
     W_np = np.full((n_in, h1.n), v, dtype=float)
     print(W_np)
+    v = 0.0001
+    W_2np = (np.eye(h1.n, h2.n) * v).astype(float)
+    W_2np = np.full((h1.n, h2.n), v, dtype=float)
+
     W_in_h1 = NewSynapseMatrix(W_np, tau_pre=20.0, tau_post=50.0)
+    W_h1_h2 = NewSynapseMatrix(W_2np, tau_pre=20.0, tau_post=50.0)
 
 
     loss_log = []
     last_spikes = None
 
     for ep in range(epochs):
-        spikes, epoch_loss = run_epoch(X, Y_target, encoding_window, h1, W_in_h1)
+        spikes, epoch_loss = run_epoch(X, Y_target, encoding_window, h1, h2, W_in_h1, W_h1_h2)
         last_spikes = spikes
         # reset membrane potentials
-        h1.state_reset()      # record simple Hebbian proxy: total abs weight change accumulated
+        h1.state_reset()  # record simple Hebbian proxy: total abs weight change accumulated
+        h2.state_reset()  # record simple Hebbian proxy: total abs weight change accumulated
         loss_log.append(epoch_loss / float(max(1, T)))
         #print(f"Epoch {ep+1}/{epochs}:  Loss={loss_log[-1]:.6e}")
 
@@ -452,10 +478,10 @@ def train(epochs=10, T=30, encoding_window=10.0, seed=None):
 
 # ---------------- Plotting ----------------
 def plot_progress_and_raster(spikes, loss_log):
-    offsets = {"in":0,"h1":6, "tgt":24}
-    colors = {"in":"tab:blue", "h1":"tab:green", "tgt":"tab:purple"}
+    offsets = {"in":0,"h1":6, "h2":12, "tgt":24}
+    colors = {"in":"tab:blue", "h1":"tab:green", "h2":"black", "tgt":"tab:purple"}
     labels_done = set()
-    for key in ["in","h1","tgt"]:
+    for key in ["in","h1","h2","tgt"]:
         events = spikes.get(key, [])
         for (t, idx, amp) in events:
             label = key if key not in labels_done else None

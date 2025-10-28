@@ -450,13 +450,13 @@ def train(epochs=10, T=30, encoding_window=10.0, seed=None):
                        name="h1", init_dend_tau=9.0, init_dend_gain=1.0)
 
     # HIER LIEGT DER HUND BEGRABEN
-    v = 0.0005
+    v = 0.005
     W_np = (np.eye(n_in, h1.n) * v).astype(float)
-    W_np = np.full((n_in, h1.n), v, dtype=float)
+    #W_np = np.full((n_in, h1.n), v, dtype=float)
     print(W_np)
-    v = 0.0001
+    v = 0.0005
     W_2np = (np.eye(h1.n, h2.n) * v).astype(float)
-    W_2np = np.full((h1.n, h2.n), v, dtype=float)
+    #W_2np = np.full((h1.n, h2.n), v, dtype=float)
 
     W_in_h1 = NewSynapseMatrix(W_np, tau_pre=20.0, tau_post=50.0)
     W_h1_h2 = NewSynapseMatrix(W_2np, tau_pre=20.0, tau_post=50.0)

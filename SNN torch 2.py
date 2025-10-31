@@ -57,7 +57,7 @@ class TemporalSNN_Autoencoder(nn.Module):
         self.input_len = input_len
         self.hidden_size = hidden_size
 
-        # Depthwise Conv1d over full sequence
+        # Encoder
         self.encoder_conv = nn.Conv1d(
             in_channels=channels,
             out_channels=channels,
@@ -67,36 +67,30 @@ class TemporalSNN_Autoencoder(nn.Module):
         )
         self.encoder_lif = LIFNeuron()
 
-        # Hidden layer applied per timestep
+        # Hidden per timestep
         self.fc_hidden = nn.Linear(channels, hidden_size)
         self.hidden_lif = LIFNeuron()
 
-        # Decoder
+        # Spike Decoding nach §3.4: nur Linear
         self.fc_out = nn.Linear(hidden_size, channels)
-        self.out_lif = LIFNeuron()
+        # self.out_lif = LIFNeuron()  # <- nicht mehr benutzt
 
     def forward(self, x):
-        # x: [batch, channels, timesteps]
-        batch, channels, T = x.shape
+        # x: [B, C, T]
+        x_conv   = self.encoder_conv(x)          # [B, C, T]
+        x_spikes = self.encoder_lif(x_conv)      # [B, C, T] (spiking hidden states inputseitig)
 
-        # 1️⃣ Encoder conv + LIF
-        x_conv = self.encoder_conv(x)            # [batch, channels, timesteps]
-        x_spikes = self.encoder_lif(x_conv)      # temporal integration over timesteps -> latency encoded input
-        # LIF neuron integrates over timesteps --> a good match with conv kernel yields higher membrane potential --> produces an EARLIER spike
+        # Hidden pro Zeitschritt
+        h       = self.fc_hidden(x_spikes.permute(0, 2, 1))  # [B, T, H]
+        h       = h.permute(0, 2, 1)                         # [B, H, T]
+        h_spike = self.hidden_lif(h)                         # [B, H, T] = S_hidden
 
-        # 2️⃣ Hidden layer per timestep
-        h = self.fc_hidden(x_spikes.permute(0,2,1))   # [batch, timesteps, hidden_size]
-        h = h.permute(0,2,1)                           # [batch, hidden_size, timesteps]
-        h_spikes = self.hidden_lif(h)
+        # §3.4 Spike Decoding: Y = Linear(S_hidden), zeitlich pro Schritt
+        y_t   = self.fc_out(h_spike.permute(0, 2, 1))        # [B, T, C]
+        y_hat = y_t.permute(0, 2, 1)                         # [B, C, T]
 
-        # 3️⃣ Decoder per timestep
-        o = self.fc_out(h_spikes.permute(0,2,1))      # [batch, timesteps, channels]
-        o = o.permute(0,2,1)                           # [batch, channels, timesteps]
-        o_spikes = self.out_lif(o)
+        return y_hat
 
-        # 4️⃣ Reconstruction: average spikes over time
-        output = o_spikes.mean(dim=2)                  # [batch, channels]
-        return output
 
 # -----------------------------
 # 4️⃣ Training setup
@@ -124,7 +118,7 @@ for epoch in range(num_epochs):
     model.train()
     optimizer.zero_grad()
     output = model(x_train)
-    loss = criterion(output, x_train.mean(dim=2))  # reconstruct mean signal
+    loss = criterion(output, x_train)
     loss.backward()
     optimizer.step()
     loss_history.append(loss.item())
@@ -153,7 +147,7 @@ time = range(timesteps)
 for c in range(channels):
     plt.figure(figsize=(8,3))
     plt.plot(time, x_train[0,c].cpu(), label=f"Original channel {c}")
-    plt.plot(time, output[0,c].repeat(timesteps).cpu(), '--', label=f"Reconstruction channel {c}")
+    plt.plot(time, output[0, c].cpu(), '--', label=f"Reconstruction channel {c}")
     plt.legend()
     plt.xlabel("Timestep")
     plt.show()

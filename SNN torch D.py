@@ -143,7 +143,7 @@ class ChannelLatencySeq2Value(nn.Module):
 # STDP update function (batch-averaged)
 # ------------------------
 
-def stdp_update_from_latencies(model, latencies, stdp_lr=1e-3, A_plus=0.01, A_minus=0.012, tau_plus=2.0, tau_minus=2.0, clip=0.1):
+def stdp_update_from_latencies(model, latencies, stdp_lr=1e-3, A_plus=0.01, A_minus=0.012, tau_plus=2.0, tau_minus=2.0, clip=1):
     # latencies: (batch, channels)
     mean_lat = latencies.mean(dim=0)  # (channels,)
     C = latencies.shape[1]
@@ -241,12 +241,15 @@ def plot_adjacency(adj, title='Inferred adjacency'):
 def train_seq2value_stdp(model, data_tensor, val_tensor=None, epochs=200, batch_size=64, lr=1e-3,
                          l1_weight=1e-4, proximal_lambda=0.0, stdp_lr=1e-3,
                          adjacency_threshold=0.1, device=None, autoreg_masking=True,
-                         order_consistency_alpha=0.0):
+                         order_consistency_alpha=0.0,
+                         # 🔽 NEU:
+                         print_adj_per_batch=False,
+                         adj_print_threshold=0.1):
+    import numpy as np
     device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
     model.to(device)
     model.zero_output_diagonal_()
 
-    # accept either a single tensor or a tuple/list
     if isinstance(data_tensor, (tuple, list)):
         x_tensor = data_tensor[0]
     else:
@@ -267,18 +270,28 @@ def train_seq2value_stdp(model, data_tensor, val_tensor=None, epochs=200, batch_
         model.train()
         total_loss = 0.0
         n = 0
-        for (xb,) in loader:
+        for bidx, (xb,) in enumerate(loader):
             xb = xb.to(device)
+
+            # ---------- 🔎 DEBUG-PRINT *vor* Updates: Adjazenz dieser Iteration ----------
+            if print_adj_per_batch:
+                with torch.no_grad():
+                    # Diagonale sauber halten, dann kopieren
+                    model.zero_output_diagonal_()
+                    W = model.output_gates.detach().cpu().numpy().copy()
+                    np.fill_diagonal(W, 0.0)
+                    print("Raw output_gates:\n", np.round(W, 3))
+
+
+            # ---------- normaler Trainingsschritt ----------
             opt.zero_grad()
             pred_lat, true_lat, act = model(xb)
-            # primary supervised latency loss (L1)
+
             latency_loss = torch.mean(torch.abs(pred_lat - true_lat))
 
-            # optional order consistency: encourage same ordering between pred and true
             order_loss = 0.0
             if order_consistency_alpha > 0.0:
-                # pairwise order mismatch penalty (relu encourages sign mismatches)
-                pred_diff = pred_lat.unsqueeze(1) - pred_lat.unsqueeze(2)  # (B, C, C)
+                pred_diff = pred_lat.unsqueeze(1) - pred_lat.unsqueeze(2)
                 true_diff = true_lat.unsqueeze(1) - true_lat.unsqueeze(2)
                 order_loss = torch.mean(torch.relu(-pred_diff * torch.sign(true_diff)))
 
@@ -286,7 +299,7 @@ def train_seq2value_stdp(model, data_tensor, val_tensor=None, epochs=200, batch_
             loss.backward()
             opt.step()
 
-            # proximal (soft-threshold) on gates to encourage zeros
+            # Proximal-Schrumpfung auf Gates (optional)
             if proximal_lambda > 0.0:
                 with torch.no_grad():
                     param = model.output_gates
@@ -294,8 +307,7 @@ def train_seq2value_stdp(model, data_tensor, val_tensor=None, epochs=200, batch_
                     diag_idx = torch.eye(channels, device=param.device).bool()
                     param[diag_idx] = 0.0
 
-            # STDP update based on batch latencies
-
+            # STDP-Update (außerhalb des Gradientenflusses)
             stdp_update_from_latencies(model, true_lat, stdp_lr=stdp_lr)
 
             total_loss += loss.item() * xb.shape[0]
@@ -331,7 +343,6 @@ def train_seq2value_stdp(model, data_tensor, val_tensor=None, epochs=200, batch_
 
         if (ep + 1) % max(1, epochs // 10) == 0 or ep < 5:
             print(f"Epoch {ep+1}/{epochs}  train_loss={avg_loss:.6f}  val_loss={history['val_loss'][-1]}")
-
     return model, history
 
 # ------------------------
@@ -353,7 +364,7 @@ if __name__ == '__main__':
     model = ChannelLatencySeq2Value(channels=C, kernel_specs=[(3,6),(5,6),(9,6)], lif_tau=5.0, lif_threshold=0.5)
 
     model, history = train_seq2value_stdp(model, inp, epochs=50, batch_size=128, lr=1e-3,
-                                         l1_weight=1e-5, proximal_lambda=1e-4, stdp_lr=1e-2,
+                                         l1_weight=1e-5, proximal_lambda=1e-4, stdp_lr=1e-2,print_adj_per_batch=True,
                                          adjacency_threshold=0.05)
 
     adj, gate = extract_channel_adjacency(model, threshold=0.05)

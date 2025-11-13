@@ -127,10 +127,10 @@ class ChannelLatencySeq2Value(nn.Module):
         # convert true_latency to activation (earlier -> larger)
         scale = torch.clamp(self.latency_scale, min=1e-3)
         act = torch.exp(-true_latency / scale)  # (batch, channels)
-
+        #print('lat',true_latency,'scale',scale)
         # mix via gates: mixed_j = bias_j + sum_i gates[j,i] * act_i
-        mixed = torch.matmul(act, self.output_gates.t()) + self.bias.unsqueeze(0)
-
+        mixed = torch.matmul(act, self.output_gates.t()) #+ self.bias.unsqueeze(0)
+        ###print('actual=',torch.matmul(act, self.output_gates.t()), 'bias=',self.bias.unsqueeze(0) )
         # predict latency directly from mixed signal
         raw_pred = self.post_mlp(mixed)  # (batch, channels) unconstrained
         # make positive and in-range [0,T]
@@ -280,7 +280,7 @@ def train_seq2value_stdp(model, data_tensor, val_tensor=None, epochs=200, batch_
                     model.zero_output_diagonal_()
                     W = model.output_gates.detach().cpu().numpy().copy()
                     np.fill_diagonal(W, 0.0)
-                    print("Raw output_gates:\n", np.round(W, 3))
+                    #print("Raw output_gates:\n", np.round(W, 3))
 
 
             # ---------- normaler Trainingsschritt ----------
@@ -361,9 +361,9 @@ if __name__ == '__main__':
 
     inp = data  # we derive target latencies from the same multichannel sequence
 
-    model = ChannelLatencySeq2Value(channels=C, kernel_specs=[(3,6),(5,6),(9,6)], lif_tau=5.0, lif_threshold=0.5)
+    model = ChannelLatencySeq2Value(channels=C, kernel_specs=[(3,6),(5,6),(9,6)], lif_tau=5.0, lif_threshold=0.03)
 
-    model, history = train_seq2value_stdp(model, inp, epochs=50, batch_size=128, lr=1e-3,
+    model, history = train_seq2value_stdp(model, inp, epochs=500, batch_size=128, lr=1e-3,
                                          l1_weight=1e-5, proximal_lambda=1e-4, stdp_lr=1e-2,print_adj_per_batch=True,
                                          adjacency_threshold=0.05)
 

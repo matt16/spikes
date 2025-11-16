@@ -1,7 +1,6 @@
 """
 Channel-latency Spiking Seq→Value Predictor with STDP and latency loss (PyTorch)
 
-This revision implements your requested change:
 - Supervised objective is **latency loss** (absolute difference between predicted and true spike times) instead of MSE on scalar outputs.
 - The model predicts **latencies** directly (one scalar per channel). The true latencies are computed by applying the same encoder+LIF latency encoder to the data — so encoder and decoder use the exact same latency code.
 - STDP remains and uses batch-averaged latencies to potentiate source->target gates when source spikes earlier than target.
@@ -105,11 +104,7 @@ class ChannelLatencySeq2Value(nn.Module):
 
         # MLP that maps mixed activations -> predicted latency (one scalar per channel)
         # We'll output positive numbers via softplus and clamp them to [0, T]
-        self.post_mlp = nn.Sequential(
-            nn.Linear(channels, decoder_channels),
-            nn.ReLU(),
-            nn.Linear(decoder_channels, channels)
-        )
+        self.post_mlp = nn.Sequential(nn.Linear(channels, decoder_channels), nn.ReLU(), nn.Linear(decoder_channels, channels))
         nn.init.xavier_uniform_(self.output_gates)
         with torch.no_grad():
             self.zero_output_diagonal_()
@@ -136,7 +131,6 @@ class ChannelLatencySeq2Value(nn.Module):
         # make positive and in-range [0,T]
         pred_latency = F.softplus(raw_pred)
         pred_latency = torch.clamp(pred_latency, min=0.0, max=float(T))
-
         return pred_latency, true_latency, act
 
 # ------------------------

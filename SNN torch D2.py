@@ -96,7 +96,7 @@ class DepthwiseMultiPathEncoder(nn.Module):
 # Channel-latency Spiking Seq->Value model with STDP
 # ------------------------
 class ChannelLatencySeq2Value(nn.Module):
-    def __init__(self, channels, kernel_specs=[(3,6),(5,6),(9,6)], lif_tau=5.0, lif_threshold=1.0, decoder_channels=128):
+    def __init__(self, channels, kernel_specs=[(3,2),(5,2)], lif_tau=5.0, lif_threshold=1.0, decoder_channels=128):
         super().__init__()
         self.channels = channels
         self.encoder = DepthwiseMultiPathEncoder(channels, kernel_specs=kernel_specs)
@@ -166,24 +166,52 @@ class ChannelLatencySeq2Value(nn.Module):
 # ------------------------
 # STDP update function (batch-averaged)
 # ------------------------
-def stdp_update_from_latencies(model: ChannelLatencySeq2Value, latencies: torch.Tensor, stdp_lr=1e-3, A_plus=0.01, A_minus=0.012, tau_plus=2.0, tau_minus=2.0, clip=1.0):
+def stdp_update_from_latencies(
+    model: ChannelLatencySeq2Value,
+    latencies: torch.Tensor,
+    stdp_lr=1e-3,
+    A_plus=0.01,
+    A_minus=0.012,
+    tau_plus=2.0,
+    tau_minus=2.0,
+    clip=1.0,
+):
+    #print("\n[STDP BEFORE] output_gates before STDP update:")
+    #print(model.output_gates.detach().cpu().numpy())
+
     # latencies: (batch, channels)
     mean_lat = latencies.mean(dim=0)  # (channels,)
     C = latencies.shape[1]
     device = mean_lat.device
+
+    # compute STDP pairwise timing differences
     t_post = mean_lat.view(C, 1)
-    t_pre = mean_lat.view(1, C)
+    t_pre  = mean_lat.view(1, C)
     delta = t_post - t_pre
+
     pos_mask = (delta > 0).float()
     neg_mask = (delta <= 0).float()
-    pot = A_plus * torch.exp(-delta / tau_plus) * pos_mask
-    dep = -A_minus * torch.exp(delta / tau_minus) * neg_mask
+
+    pot = A_plus  * torch.exp(-delta / tau_plus)  * pos_mask
+    dep = -A_minus * torch.exp( delta / tau_minus) * neg_mask
+
     delta_w = pot + dep
     delta_w = delta_w * (1.0 - torch.eye(C, device=device))  # zero diag
+
+    # -----------------------------
+    # compute STDP metric (before update)
+    # -----------------------------
+    stdp_metric = (stdp_lr * delta_w).abs().mean().item()
+
+    # -----------------------------
+    # apply update
+    # -----------------------------
     with torch.no_grad():
         model.output_gates += stdp_lr * delta_w
         model.output_gates.clamp_(min=-clip, max=clip)
         model.zero_output_diagonal_()
+
+    return stdp_metric
 
 # ------------------------
 # Utilities
@@ -234,6 +262,118 @@ def plot_adjacency(adj, title='Inferred adjacency'):
     plt.ylabel('Target channel')
     plt.show()
 
+
+def plot_latencies_subplots(pred_latencies, true_latencies, title="Predicted vs True Latencies"):
+    pred = pred_latencies.detach().cpu().numpy()
+    true = true_latencies.detach().cpu().numpy()
+    num_channels = pred.shape[1]
+
+    fig, axes = plt.subplots(1, num_channels, figsize=(4 * num_channels, 4), sharey=True)
+    if num_channels == 1:
+        axes = [axes]
+
+    for i in range(num_channels):
+        ax = axes[i]
+        ax.scatter(true[:, i], pred[:, i], alpha=0.6, edgecolor='k')
+        ax.plot(
+            [true[:, i].min(), true[:, i].max()],
+            [true[:, i].min(), true[:, i].max()],
+            'r--', lw=1.5
+        )
+        ax.set_title(f'Channel {i + 1}')
+        ax.set_xlabel('True latency')
+        if i == 0:
+            ax.set_ylabel('Predicted latency')
+        ax.grid(True, alpha=0.3)
+
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+    # ------------------------------
+    # NEW: Print true vs predicted for channel 0
+    # ------------------------------
+    print("\n=== Channel 0: True vs Predicted Latencies ===")
+    print("True values (list):")
+    print(true[:, 0].tolist())
+
+    print("\nPredicted values (list):")
+    print(pred[:, 0].tolist())
+
+
+#plot different loss components
+def plot_loss_components(history):
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+    axes = axes.ravel()
+
+    components = [
+        ('train_latency_loss',   'Latency loss'),
+        ('train_order_loss',     'Order loss'),
+        ('train_sparsity_loss',  'Sparsity (L1)'),
+        ('train_dom_loss',       'Dominance loss'),
+        ('train_cycle_loss',     'Cycle loss'),
+        ('train_stdp_update',    'STDP update'),
+    ]
+
+    for ax, (key, title) in zip(axes, components):
+        if key not in history or len(history[key]) == 0:
+            ax.set_visible(False)
+            continue
+
+        ax.plot(history[key], label=title)
+        ax.set_title(title)
+        ax.set_xlabel('Epoch')
+        ax.set_ylabel('Value')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    plt.suptitle('Loss Components Evolution')
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_output_gate_trajectories_batches(gate_history):
+
+    gate_hist = np.stack(gate_history, axis=0)   # (B, C, C)
+    B, C, _ = gate_hist.shape
+    steps = np.arange(B)
+
+    # Alle Off-Diagonal-Paare
+    indices = [(i, j) for i in range(C) for j in range(C) if i != j]
+    n_plots = len(indices)
+
+    cols = int(np.ceil(np.sqrt(n_plots)))
+    rows = int(np.ceil(n_plots / cols))
+
+    fig, axes = plt.subplots(rows, cols, figsize=(4*cols, 3*rows), sharex=True)
+    axes = np.array(axes).reshape(rows, cols)
+
+    for k, (i, j) in enumerate(indices):
+        r = k // cols
+        c = k % cols
+        ax = axes[r, c]
+
+        ax.plot(steps, gate_hist[:, i, j])
+        ax.set_title(f"gate[{i}→{j}]")
+        ax.grid(True, alpha=0.3)
+
+        if r == rows - 1:
+            ax.set_xlabel("Batch Step")
+        if c == 0:
+            ax.set_ylabel("Weight")
+
+    # Unbenutzte Achsen ausblenden
+    for k in range(n_plots, rows*cols):
+        r = k // cols
+        c = k % cols
+        axes[r, c].set_visible(False)
+
+    plt.suptitle("Output-gate weights over training (per batch)")
+    plt.tight_layout()
+    plt.show()
+
+
+
 def plot_relevant_kernels(model: ChannelLatencySeq2Value, encoder_kernels, spike_batch_label="Spike Batch"):
     """
     Plots:
@@ -261,47 +401,177 @@ def plot_relevant_kernels(model: ChannelLatencySeq2Value, encoder_kernels, spike
     plt.tight_layout()
     plt.show()
 
-    # ---- build kernel matrix in the same concatenation order (C*D, K)
-    # encoder_kernels can be a list of conv modules or list of (C, out_per, K) tensors
-    if isinstance(encoder_kernels, (list, tuple)) and len(encoder_kernels) > 0 and isinstance(encoder_kernels[0], nn.Conv1d):
-        # encoder_kernels is the list of conv modules (model.encoder.convs)
-        kernels_list = []
-        for (k, out_per), conv in zip(model.encoder.kernel_specs, model.encoder.convs):
-            w = conv.weight.detach().cpu()           # (C*out_per, 1, k)
+    # ---- build list of per-dendrite kernel vectors (each can have its own length K_i)
+    dendrite_kernels = []
+
+    # Fall 1: wir bekommen die Conv-Layer (z.B. model.encoder.convs)
+    if isinstance(encoder_kernels, (list, tuple, nn.ModuleList)) and len(encoder_kernels) > 0 and isinstance(
+            encoder_kernels[0], nn.Conv1d):
+        for (k_size, out_per), conv in zip(model.encoder.kernel_specs, encoder_kernels):
+            # conv.weight: (C*out_per, 1, k_size)
+            w = conv.weight.detach().cpu()
             C = model.encoder.channels
-            w = w.view(C, out_per, -1)               # (C, out_per, K)
-            kernels_list.append(w)                   # keep per-spec
-        # concatenate along dendrite axis -> (C, D, K)
-        kernels_CD = torch.cat(kernels_list, dim=1)    # (C, D, K)
+            w = w.view(C, out_per, k_size)  # (C, out_per, k_size)
+            for c in range(C):
+                for d in range(out_per):
+                    # 1D-Array für diese Dendrite
+                    dendrite_kernels.append(w[c, d].numpy())  # shape: (k_size,)
+
+    # Fall 2: wir bekommen schon Tensoren aus get_all_kernels()
+    elif isinstance(encoder_kernels, list) and len(encoder_kernels) > 0 and isinstance(encoder_kernels[0],
+                                                                                       torch.Tensor):
+        for w in encoder_kernels:
+            w = w.detach().cpu()  # (C, out_per, K)
+            C, out_per, k_size = w.shape
+            for c in range(C):
+                for d in range(out_per):
+                    dendrite_kernels.append(w[c, d].numpy())
+
+    elif isinstance(encoder_kernels, torch.Tensor):
+        # erwarten Form (C, D, K)
+        w = encoder_kernels.detach().cpu()
+        if w.ndim != 3:
+            raise ValueError(f"Expected encoder_kernels as (C, D, K) tensor, got shape {w.shape}")
+        C, D, k_size = w.shape
+        for c in range(C):
+            for d in range(D):
+                dendrite_kernels.append(w[c, d].numpy())
     else:
-        # assume encoder_kernels is list of (C, out_per, K) tensors (from get_all_kernels)
-        # or a single numpy/tensor shaped (C, D, K)
-        if isinstance(encoder_kernels, list):
-            kernels_CD = torch.cat(encoder_kernels, dim=1)  # list of (C, out_per, K)
-        else:
-            # tensor-like
-            kernels_CD = torch.tensor(encoder_kernels) if not isinstance(encoder_kernels, torch.Tensor) else encoder_kernels
+        raise TypeError(f"Unsupported type for encoder_kernels: {type(encoder_kernels)}")
 
-    C, D, K = kernels_CD.shape
-    kernels_flat = kernels_CD.reshape(C * D, K).numpy()  # (C*D, K)
 
-    # ---- bar plot for each dendrite (arranged in grid if many dendrites)
-    num_dendrites = kernels_flat.shape[0]
-    cols = 4
-    rows = int(np.ceil(num_dendrites / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 2.5 * rows))
-    axes = np.array(axes).reshape(-1)
-    for i in range(len(axes)):
-        ax = axes[i]
-        if i < num_dendrites:
-            ax.bar(np.arange(K), kernels_flat[i])
-            ax.set_title(f"Dendrite {i}")
-            ax.set_xticks([])
-        else:
-            ax.axis('off')
-    plt.suptitle("Dendrite Kernel Weights (concatenated C×D order)")
+
+    plt.show()
+
+
+def plot_encoder_kernels_as_tables(model: ChannelLatencySeq2Value, decimals=4):
+    """
+    Plottet die finalen Encoder-Kernelgewichte als Tabellen.
+
+    Layout:
+      - Zeilen: Channels
+      - Spalten: kernel_specs
+    In jedem Subplot:
+      - Eine Tabelle (out_per x kernel_size) NUR mit Zahlen.
+        -> KEINE rowLabels, KEINE colLabels.
+    """
+
+
+    encoder = model.encoder
+    C = encoder.channels
+    specs = encoder.kernel_specs
+    convs = encoder.convs
+    num_specs = len(specs)
+
+    # Figure vorbereiten
+    fig, axes = plt.subplots(C, num_specs, figsize=(4 * num_specs, 2.5 * C))
+
+    # Ensure axes is always 2D
+    if C == 1 and num_specs == 1:
+        axes = np.array([[axes]])
+    elif C == 1:
+        axes = np.expand_dims(axes, axis=0)
+    elif num_specs == 1:
+        axes = np.expand_dims(axes, axis=1)
+    else:
+        axes = np.array(axes)
+
+    for spec_idx, ((k, out_per), conv) in enumerate(zip(specs, convs)):
+        # Extract weights (C, out_per, k)
+        w = conv.weight.detach().cpu().numpy().reshape(C, out_per, k)
+
+        for c in range(C):
+            ax = axes[c, spec_idx]
+            ax.axis("off")
+
+            kernels = w[c]  # (out_per, k)
+            data = np.round(kernels, decimals=decimals)
+
+            # Tabelle OHNE Labels erstellen
+            table = ax.table(
+                cellText=data,
+                loc="center"
+            )
+            table.scale(1.2, 1.2)
+
+            ax.set_title(f"Channel {c}, k={k}, {out_per} Filter", fontsize=9)
+
+    plt.suptitle("Finale Encoder-Kernel pro Channel und Kernelgröße", fontsize=14)
     plt.tight_layout()
     plt.show()
+
+
+def plot_input_channels(inp, sample_idx=0):
+    """
+    Plottet die drei Input-Kanäle X, Y, Z in drei Subplots untereinander.
+
+    Parameter:
+    - inp: Tensor der Form (N, 3, T)
+    - sample_idx: welches Sample geplottet werden soll (Standard: 0)
+    """
+    import matplotlib.pyplot as plt
+
+    data = inp[sample_idx].detach().cpu()  # (3, T)
+    names = ["X (Channel 0)", "Y (Channel 1)", "Z (Channel 2)"]
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+
+    for i in range(3):
+        axes[i].plot(data[i])
+        axes[i].set_title(names[i])
+        axes[i].grid(True, alpha=0.3)
+
+    axes[-1].set_xlabel("Time")
+    plt.suptitle(f"Input Data (Sample {sample_idx})")
+    plt.tight_layout()
+    plt.show()
+
+def plot_encoder_kernels_as_curves(model: ChannelLatencySeq2Value):
+    """
+    Plottet die finalen Encoder-Kernelgewichte als Kurven.
+
+    Layout:
+      - Zeilen: Channels
+      - Spalten: kernel_specs
+    In jedem Subplot:
+      - x-Achse: Kernel-Index (0..k-1)
+      - y-Achse: Gewicht
+      - eine Kurve pro Filter (out_per)
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    encoder = model.encoder
+    C = encoder.channels
+    specs = encoder.kernel_specs
+    convs = encoder.convs
+    num_specs = len(specs)
+
+    fig, axes = plt.subplots(C, num_specs, figsize=(4 * num_specs, 3 * C), squeeze=False)
+
+    for spec_idx, ((k, out_per), conv) in enumerate(zip(specs, convs)):
+        # conv.weight: (C*out_per, 1, k) -> (C, out_per, k)
+        w = conv.weight.detach().cpu().numpy().reshape(C, out_per, k)
+        x = np.arange(k)
+
+        for c in range(C):
+            ax = axes[c, spec_idx]
+            ax.set_title(f"Channel {c}, k={k}", fontsize=9)
+
+            for f_idx in range(out_per):
+                kernel_vals = w[c, f_idx]  # (k,)
+                ax.plot(x, kernel_vals, marker="o", linewidth=1, alpha=0.9, label=f"f{f_idx}")
+
+            ax.set_xlabel("Kernel index")
+            ax.set_ylabel("Weight")
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=7)
+
+    plt.suptitle("Encoder-Kernel als Kurven pro Channel und Kernelgröße", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
 
 # ------------------------
 # MAIN: simplified training loop with extended losses
@@ -313,7 +583,7 @@ if __name__ == '__main__':
     # toy data
     N, C, T = 512, 3, 64
     t = torch.arange(T).float()
-    X = torch.sin(t.unsqueeze(0) * 0.2).unsqueeze(0).repeat(N, 1, 1) + 0.01 * torch.randn(N, 1, T)
+    X = torch.cos(t.unsqueeze(0) * 0.5).unsqueeze(0).repeat(N, 1, 1)*torch.sin(t.unsqueeze(0) * 0.2).unsqueeze(0).repeat(N, 1, 1) + 0.01 * torch.randn(N, 1, T)
     Y = 0.5 * F.pad(X[:, 0, :-1], (1, 0)) + 0.35 * torch.randn(N, T)  # more noisy so longer latency
     Y = Y.unsqueeze(1)
     Z = 0.3 * F.pad(X[:, 0, :-1], (1, 0)) + 0.4 * F.pad(Y[:, 0, :-1], (1, 0)) + 0.25 * torch.randn(N, T)
@@ -322,20 +592,20 @@ if __name__ == '__main__':
     inp = data  # supervised target is derived from the same multichannel sequence
 
     # model
-    model = ChannelLatencySeq2Value(channels=C, kernel_specs=[(3,6),(5,6),(9,6)], lif_tau=5.0, lif_threshold=0.03)
+    model = ChannelLatencySeq2Value(channels=C, kernel_specs=[(3,6),(5,6),(9,6)], lif_tau=5.0, lif_threshold=0.01)
     model.to(device)
     model.zero_output_diagonal_()
 
     # training hyperparams
-    epochs = 500
+    epochs = 100
     batch_size = 128
-    lr = 1e-3
-    l1_weight = 1e-5         # sparsity coefficient (lambda)
-    beta_cycle = 1e-2        # cycle suppression coefficient (beta)
+    lr = 0.003
+    l1_weight = 0 #1e-5         # sparsity coefficient (lambda)
+    beta_cycle = 0.3     # cycle suppression coefficient (beta)
     gamma_dom = 0.0          # dominance coefficient (optional)
     epsilon_dom = 1.0        # small threshold for dominance term (unused if gamma_dom==0)
-    proximal_lambda = 1e-4
-    stdp_lr = 1e-2
+    proximal_lambda = 0
+    stdp_lr = 0
     adjacency_threshold = 0.05
     order_consistency_alpha = 0.0
 
@@ -344,64 +614,115 @@ if __name__ == '__main__':
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # optimizer excludes output_gates (updated by STDP)
-    opt = torch.optim.Adam([p for p in model.parameters() if p is not model.output_gates], lr=lr)
-    history = {'train_loss': [], 'val_loss': [], 'adjacency': []}
+    opt = torch.optim.Adam([p for p in model.parameters()], lr=lr)
+    #opt = torch.optim.Adam([p for p in model.parameters() if p is not model.output_gates], lr=lr)
+    gate_history = []
+    history = {
+        'train_loss': [],
+        'val_loss': [],  # falls du das schon nutzt
+
+        'train_latency_loss': [],
+        'train_order_loss': [],
+        'train_sparsity_loss': [],  # L1
+        'train_cycle_loss': [],
+        'train_dom_loss': [],
+        'train_stdp_update': [],  # STDP-Metrik
+    }
 
     for ep in range(epochs):
         model.train()
         total_loss = 0.0
+        total_latency_loss = 0.0
+        total_order_loss = 0.0
+        total_l1 = 0.0
+        total_cycle_loss = 0.0
+        total_dom_loss = 0.0
+        total_stdp_update = 0.0
+
         n_examples = 0
+
         for (xb,) in loader:
             xb = xb.to(device)
             opt.zero_grad()
+
             pred_lat, true_lat, act, dendrites = model(xb)
-            # supervised latency reconstruction (L1)
+
+            # 1) supervised latency reconstruction (L1)
             latency_loss = torch.mean(torch.abs(pred_lat - true_lat))
-            # optional ordering consistency loss (keeps predicted order consistent with true)
+
+            # 2) optional ordering consistency loss
             order_loss = 0.0
             if order_consistency_alpha > 0.0:
                 pred_diff = pred_lat.unsqueeze(1) - pred_lat.unsqueeze(2)
                 true_diff = true_lat.unsqueeze(1) - true_lat.unsqueeze(2)
                 order_loss = torch.mean(torch.relu(-pred_diff * torch.sign(true_diff)))
+            # du kannst hier auch "order_loss_eff = order_consistency_alpha * order_loss" loggen,
+            # wenn du den tatsächlichen Beitrag im Gesamt-Loss sehen willst.
 
-            # sparsity (L1) on gates
+            # 3) sparsity (L1) on gates
             l1 = l1_weight * torch.sum(torch.abs(model.output_gates))
 
-            # cycle suppression: penalize mutual edges g_ij * g_ji
+            # 4) cycle suppression
             G = model.output_gates
             Cc = G.shape[0]
             eye = torch.eye(Cc, device=G.device)
             mask = 1.0 - eye
-            # sum_{i<j} |g_ij * g_ji| = 0.5 * sum_{i!=j} |g_ij * g_ji|
             cycle_loss = beta_cycle * 0.5 * torch.sum(torch.abs((G * G.t()) * mask))
 
-            # optional dominance penalty: penalize many small parents per target (encourage one strong parent)
+            # 5) dominance penalty
             dom_loss = 0.0
             if gamma_dom > 0.0:
-                # for each target j, measure L1 over incoming edges and penalize if it exceeds epsilon_dom
-                incoming = torch.sum(torch.abs(G), dim=1)  # shape (C,) incoming sum for each target
+                incoming = torch.sum(torch.abs(G), dim=1)
                 dom_loss = gamma_dom * torch.sum(torch.relu(incoming - epsilon_dom))
 
+            # total-Loss
             loss = latency_loss + order_consistency_alpha * order_loss + l1 + cycle_loss + dom_loss
             loss.backward()
             opt.step()
 
-            # proximal shrinkage on gates (soft-thresholding) to encourage exact sparsity
+            # proximal shrinkage auf Gates (wie gehabt)
             if proximal_lambda > 0.0:
                 with torch.no_grad():
                     param = model.output_gates
                     param.copy_(torch.sign(param) * torch.clamp(torch.abs(param) - proximal_lambda, min=0.0))
                     model.zero_output_diagonal_()
 
-            # STDP update (outside autograd)
-            stdp_update_from_latencies(model, true_lat, stdp_lr=stdp_lr)
+            # 6) STDP update (hier nehmen wir an, dass die Funktion eine Skalar-Metrik zurückgibt)
+            stdp_metric = stdp_update_from_latencies(model, true_lat, stdp_lr=stdp_lr)
+            # falls deine Funktion aktuell nichts zurückgibt, einfach dort z.B. die Summe der
+            # absoluten Gewichtsänderungen berechnen und zurückgeben.
+            if stdp_metric is None:
+                stdp_metric = 0.0
+            gate_history.append(model.output_gates.detach().cpu().numpy().copy())
 
-            total_loss += loss.item() * xb.shape[0]
-            n_examples += xb.shape[0]
+            batch_size = xb.shape[0]
+            total_loss += loss.item() * batch_size
+            total_latency_loss += latency_loss.item() * batch_size
+            # hier logge ich den "rohen" order_loss, nicht alpha*order_loss:
+            total_order_loss += (order_loss if isinstance(order_loss, float) else order_loss.item()) * batch_size
+            total_l1 += l1.item() * batch_size
+            total_cycle_loss += cycle_loss.item() * batch_size
+            total_dom_loss += (dom_loss if isinstance(dom_loss, float) else dom_loss.item()) * batch_size
+            total_stdp_update += float(stdp_metric) * batch_size
 
+            n_examples += batch_size
+
+        # Epochen-Mittelwerte
         avg_loss = total_loss / n_examples
-        history['train_loss'].append(avg_loss)
+        avg_latency_loss = total_latency_loss / n_examples
+        avg_order_loss = total_order_loss / n_examples
+        avg_l1 = total_l1 / n_examples
+        avg_cycle_loss = total_cycle_loss / n_examples
+        avg_dom_loss = total_dom_loss / n_examples
+        avg_stdp_update = total_stdp_update / n_examples
 
+        history['train_loss'].append(avg_loss)
+        history['train_latency_loss'].append(avg_latency_loss)
+        history['train_order_loss'].append(avg_order_loss)
+        history['train_sparsity_loss'].append(avg_l1)
+        history['train_cycle_loss'].append(avg_cycle_loss)
+        history['train_dom_loss'].append(avg_dom_loss)
+        history['train_stdp_update'].append(avg_stdp_update)
         # simple val using the whole dataset (same data here)
         model.eval()
         with torch.no_grad():
@@ -409,10 +730,19 @@ if __name__ == '__main__':
             p_lat, t_lat, _, _ = model(x_val)
             val_loss = torch.mean(torch.abs(p_lat - t_lat)).item()
             history['val_loss'].append(val_loss)
-        adj, gate_mat = extract_channel_adjacency(model, threshold=adjacency_threshold)
-        history['adjacency'].append(adj)
+
         if (ep + 1) % max(1, epochs // 10) == 0 or ep < 5:
-            print(f"Epoch {ep+1}/{epochs}  train_loss={avg_loss:.6f}  val_loss={val_loss:.6f}")
+            print(
+                f"Epoch {ep + 1}/{epochs}  "
+                f"train_loss={avg_loss:.6f}  "
+                f"latency={avg_latency_loss:.6f}  "
+                f"order={avg_order_loss:.6f}  "
+                f"l1={avg_l1:.6f}  "
+                f"cycle={avg_cycle_loss:.6f}  "
+                f"dom={avg_dom_loss:.6f}  "
+                f"stdp={avg_stdp_update:.6f}"
+                + (f"  val_loss={val_loss:.6f}" if 'val_loss' in locals() or 'val_loss' in history else "")
+            )
 
     # ------------------------
     # Post-training: adjacency and dendritic attribution example
@@ -420,13 +750,26 @@ if __name__ == '__main__':
     adj, gate = extract_channel_adjacency(model, threshold=adjacency_threshold)
     print('Learned adjacency (thresholded):')
     print(adj)
-    plot_loss(history)
-    plot_adjacency(adj, title='Inferred gates (thresholded)')
+    #plot_loss(history)
+    #plot_latencies_subplots(pred_lat.detach(), true_lat.detach())
+    #plot_adjacency(adj, title='Inferred gates (thresholded)')
+    plot_output_gate_trajectories_batches(gate_history)
+
     # compute dendritic causal strength for each discovered edge using a small batch
     x_val = inp[:64].to(device)
     with torch.no_grad():
         p_lat, t_lat, act, dendrites = model(x_val)
     # Show relevance heatmap and kernel plots (concatenated C*D)
-    plot_relevant_kernels(model, encoder_kernels=model.encoder.convs, spike_batch_label="Validation Batch")
+    '''plot_relevant_kernels(
+        model,
+        encoder_kernels=list(model.encoder.convs),  # ModuleList -> echte Python-Liste
+        spike_batch_label="Validation Batch"
+    )'''
+    plot_loss_components(history)
     # optional: plot predicted vs true latencies for first 64 examples
     plot_latencies_subplots(p_lat.detach(), t_lat.detach())
+    #plot_encoder_kernels_as_tables(model)
+    plot_encoder_kernels_as_curves(model)
+    plot_input_channels(inp)
+
+

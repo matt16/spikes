@@ -19,7 +19,7 @@ t_min, t_max = 0.0, 40.0
 # -------------------- Synthetic data creation --------------------
 time = np.linspace(0, 1, seq_len)
 X = 0.5 * (np.sin(2*np.pi*10*time) + 1.0)
-Y = X.copy()
+Y = X.copy() + 0.05 * np.random.randn(seq_len)
 #Y = (time * 0.8) + 0.05 * np.random.randn(seq_len)
 shift = 3
 Z = np.roll(X, shift) * 0.6 + 0.4 * (0.5*(np.tanh(3*(Y-0.5))+1.0)) + 0.03 * np.random.randn(seq_len)
@@ -123,7 +123,78 @@ class FullModel(nn.Module):
         preds = torch.stack(preds, dim=1)  # (B, channels, T)
         return preds, gates
 
+#-----------Utilities----------
+def cycle_suppression_loss(model, beta_cycle=1e-3):
+    """
+    Penalizes symmetric connections G_ij and G_ji (2-cycles) in the gate matrix.
+
+    """
+    # Gates wie im forward konstruieren (mit Grad durch gate_logits!)
+    G = torch.sigmoid(model.gate_logits) * model.gate_mask  # (C, C)
+
+    # Falls du später mal batched Gates hättest, könnte man das anpassen.
+    G_eff = G  # (C, C)
+
+    C = G_eff.shape[0]
+    device = G_eff.device
+
+    eye = torch.eye(C, device=device)
+    mask = 1.0 - eye  # 1 off-diagonal, 0 auf Diagonale
+
+    sym_strength = torch.abs(G_eff * G_eff.T) * mask
+    loss = beta_cycle * 0.5 * sym_strength.sum()
+    return loss
+
 #----------------Utilities-Plotting---------
+def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
+    """
+    Plottet für EIN bestimmtes Fenster (window_idx) und EINEN Kanal:
+      - für jeden Matcher k ein Subplot
+      - arrivals[k, t] für t = 0..T-1 (ein Punkt pro t)
+      - horizontale Linie = mean arrival für diesen Matcher (nur für dieses Fenster!)
+    """
+
+    model.eval()
+    with torch.no_grad():
+        # spike_times: (1, T) nur für dieses Fenster und diesen Kanal
+        spike_times = lat_windows[window_idx, channel_idx, :].unsqueeze(0)  # (1, T)
+        matcher = model.matchers[channel_idx]
+        _, arrivals, _ = matcher(spike_times)  # arrivals: (1, K, T)
+
+    arr = arrivals.squeeze(0).cpu().numpy()  # (K, T)
+    K, T = arr.shape
+    t_idx = np.arange(T)
+
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(K, 1, figsize=(8, 2.5 * K), sharex=True)
+    if K == 1:
+        axes = [axes]
+
+    for k in range(K):
+        ax = axes[k]
+
+        vals = arr[k, :]  # arrivals für dieses Fenster & Matcher k
+
+        # Punkte + Linie
+        ax.scatter(t_idx, vals, s=30, label="arrival(t)")
+        ax.plot(t_idx, vals, alpha=0.6)
+
+        # Mean Arrival nur aus diesem Fenster
+        mean_val = vals.mean()
+        ax.axhline(mean_val, linestyle="--", linewidth=2,
+                   label=f"mean = {mean_val:.2f}")
+
+        ax.set_title(f"Channel {channel_idx}, Window {window_idx} – Matcher {k}")
+        ax.set_ylabel("arrival time")
+        ax.grid(alpha=0.3)
+        ax.legend()
+
+    axes[-1].set_xlabel("time index (0 ... T-1)")
+    plt.tight_layout()
+    plt.show()
+
+
 def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=0, window_idx=0):
     """
     Zeigt eine Tabelle mit:
@@ -336,7 +407,8 @@ for epoch in range(1, num_epochs+1):
         preds, gates = model(batch_lat)
         loss_pred = mse(preds, batch_lat)
         gate_reg = torch.mean(torch.abs(gates))
-        loss = loss_pred + 0.01 * gate_reg
+        loss_cycle = cycle_suppression_loss(model, beta_cycle=10)
+        loss = loss_pred + 0.01 * gate_reg + loss_cycle
         loss.backward()
         print("delay grad norm:", model.matchers[0].delays.grad)
         optimizer.step()
@@ -383,6 +455,8 @@ plot_matcher_table_for_channel(
 
 plot_predicted_vs_true_latencies(model, train_lat, channel_idx=1, window_idx=5)
 plot_delay_weight_history(delay_history, weight_history, channel_idx=0)
+plot_arrivals_for_window(model, train_lat, channel_idx=0, window_idx=5)
+
 
 
 
@@ -391,5 +465,5 @@ with torch.no_grad():
     preds_all, _ = model(train_lat[:6])
 for i in range(6):
     print(f"Window {i}: target channel 2 pred mean {preds_all[i,2,:].mean().item():.3f} true mean {train_lat[i,2,:].mean().item():.3f}")
-
+print(X)
 print("Demo complete.")

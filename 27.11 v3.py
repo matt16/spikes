@@ -1,4 +1,4 @@
-# spiking_seq2seq_predictor.py
+# spiking_seq2seq_predictor_dendritic_matcher_v2.py
 import torch, torch.nn as nn, torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
@@ -27,9 +27,9 @@ series = np.stack([X, Y, Z], axis=0)  # shape (channels, seq_len)
 
 # -------------------- Hankel windows and latency encoding --------------------
 def hankel_windows_multichannel(x, T, stride=1):
-    channels, L = x.shape
+    channels_, L = x.shape
     num_windows = (L - T) // stride + 1
-    out = np.zeros((num_windows, channels, T), dtype=x.dtype)
+    out = np.zeros((num_windows, channels_, T), dtype=x.dtype)
     idx = 0
     for i in range(0, L - T + 1, stride):
         out[idx] = x[:, i:i+T]
@@ -40,7 +40,7 @@ windows = hankel_windows_multichannel(series, T, stride=stride)  # (num_windows,
 num_windows = windows.shape[0]
 
 def magnitude_to_latency_batch(windows, t_min=0.0, t_max=40.0, eps=1e-8):
-    nw, ch, T = windows.shape
+    nw, ch, T_ = windows.shape
     lat = np.zeros_like(windows, dtype=float)
     for c in range(ch):
         vals = windows[:, c, :].reshape(-1)
@@ -58,27 +58,131 @@ val_lat = torch.from_numpy(latencies[split:]).float()
 
 # -------------------- Model components --------------------
 class DendriticMatcherBank(nn.Module):
-    def __init__(self, T, K, tau=40):
+    """
+    Variante 2:
+    Ein Matcher ist ein kleines dendritisches Mini-Neuron:
+
+      spike_times (B, T)
+        -> delays + PSP-Kern  (arrivals, psp)  (B, K, T)
+        -> Branch-Summen über Zeitsegmente    (B, K, n_branches)
+        -> Dendritische Subunits (Paarung von Branches, NMDA-like)
+        -> Soma-Summe pro Matcher: pot (B, K)
+
+    Das Interface nach außen bleibt gleich: forward(...) gibt (pot, arrivals, psp)
+    """
+
+    def __init__(self, T, K, tau=40, n_branches=6):
         super().__init__()
         self.T = T
         self.K = K
+        self.tau = tau
+        self.n_branches = n_branches
+
+        # Gewichte pro Zeitindex (wie vorher)
         self.w = nn.Parameter(torch.randn(K, T) * 0.2 + 0.5)
-        init = torch.linspace(T-1, 0, T).unsqueeze(0).repeat(K,1)
+        # Delays pro Zeitindex (wie vorher)
         self.delays = nn.Parameter(0.1 * torch.randn(K, T))
+
+        # ---- Branch-Partition über die Zeitindizes 0..T-1 ----
+        # Wir teilen T möglichst gleichmäßig auf n_branches auf.
+        assert n_branches >= 2, "Brauche mindestens 2 Dendriten-Branches."
+        assert T >= n_branches, "T muss >= Anzahl Branches sein."
+
+        base = T // n_branches
+        rest = T % n_branches
+        ranges = []
+        idx = 0
+        for b in range(n_branches):
+            length = base + (1 if b < rest else 0)
+            start = idx
+            end = idx + length
+            ranges.append((start, end))
+            idx = end
+        self.branch_ranges = ranges  # Liste von (start, end)
+
+        # ---- Dendritische Subunits: jeweils zwei Branches kombiniert ----
+        assert n_branches % 2 == 0, "Für einfache Paarung sollte n_branches gerade sein."
+        self.n_subunits = n_branches // 2
+        # Paarungen: (0,1), (2,3), (4,5), ...
+        self.pairs = [(2 * i, 2 * i + 1) for i in range(self.n_subunits)]
+
+        # Gewichte für die beiden Branches in jeder Subunit
+        self.subunit_W = nn.Parameter(
+            torch.randn(self.n_subunits, 2) * 0.2 + 0.5
+        )
+        # Schwellen für jede Subunit (NMDA-like)
+        self.subunit_threshold = nn.Parameter(
+            torch.ones(self.n_subunits) * 0.5
+        )
+        # Soma-Gewichte für die Subunits
+        self.soma_w = nn.Parameter(
+            torch.ones(self.n_subunits)
+        )
+
         self.tau = tau
 
     def forward(self, spike_times):  # spike_times: (B, T)
         B = spike_times.size(0)
-        st = spike_times.unsqueeze(1).expand(-1, self.K, -1)
-        delays = self.delays.unsqueeze(0).expand(B, -1, -1)
-        arrivals = st + delays  # (B, K, T)
-        t_ref, _ = torch.max(arrivals, dim=2, keepdim=True)  # (B, K, 1)
-        dt = torch.clamp(t_ref - arrivals, min=0.0)
-        #psp = torch.exp(-dt / self.tau)  # (B, K, T)
-        psp = torch.clamp(1.0 - dt / self.tau, min=0.0)
+        T_in = spike_times.size(1)
+        assert T_in == self.T, "Input-T muss mit T in der Bank übereinstimmen."
 
-        pot = torch.sum(self.w.unsqueeze(0) * psp, dim=2)  # (B, K)
+        # ------ 1) Delays + "Arrival times" + PSP-Kern (wie vorher) ------
+        # spike_times -> (B, 1, T) -> expand auf K Matcher
+        st = spike_times.unsqueeze(1).expand(-1, self.K, -1)  # (B, K, T)
+        delays = self.delays.unsqueeze(0).expand(B, -1, -1)   # (B, K, T)
+        arrivals = st + delays                                # (B, K, T)
+
+        # Referenzzeit: max arrival pro Matcher (B, K, 1)
+        t_ref, _ = torch.max(arrivals, dim=2, keepdim=True)
+        dt = torch.clamp(t_ref - arrivals, min=0.0)           # (B, K, T)
+
+        # PSP-Kern: linearer Abfall (kannst du beliebig austauschen)
+        psp = torch.clamp(1.0 - dt / self.tau, min=0.0)       # (B, K, T)
+
+        # ------ 2) PSP -> Branch-Summen über Zeitsegmente ------
+        # branch_outputs: (B, K, n_branches)
+        branch_outputs = []
+        for (start, end) in self.branch_ranges:
+            # Slice über Zeit
+            psp_slice = psp[:, :, start:end]          # (B, K, Lb)
+            w_slice = self.w[:, start:end]            # (K, Lb)
+
+            # gewichtete Summe über die Zeitindizes des Branches
+            # Ergebnis: (B, K)
+            branch_out = torch.sum(
+                psp_slice * w_slice.unsqueeze(0), dim=2
+            )
+            branch_outputs.append(branch_out)
+
+        branch_outputs = torch.stack(branch_outputs, dim=2)  # (B, K, n_branches)
+
+        # ------ 3) Branches -> Dendritische Subunits (Paarungen) ------
+        # subunits: (B, K, n_subunits)
+        subunits = []
+        for s, (i, j) in enumerate(self.pairs):
+            # Lineare Kombination der beiden Branches
+            x = (
+                self.subunit_W[s, 0] * branch_outputs[:, :, i] +
+                self.subunit_W[s, 1] * branch_outputs[:, :, j]
+            )  # (B, K)
+
+            # NMDA-ähnliche Nichtlinearität
+            y = torch.relu(x - self.subunit_threshold[s]) ** 2  # (B, K)
+            subunits.append(y)
+
+        subunits = torch.stack(subunits, dim=2)  # (B, K, n_subunits)
+
+        # ------ 4) Subunits -> Soma -> pot (ein Wert pro Matcher) ------
+        soma = torch.sum(
+            subunits * self.soma_w.view(1, 1, self.n_subunits),
+            dim=2
+        )  # (B, K)
+
+        pot = soma  # (B, K)
+
+        # Interface bleibt: pot, arrivals, psp
         return pot, arrivals, psp
+
 
 class CrossPredictor(nn.Module):
     def __init__(self, in_dim, T):
@@ -127,21 +231,17 @@ class FullModel(nn.Module):
 def cycle_suppression_loss(model, beta_cycle=1e-3):
     """
     Penalizes symmetric connections G_ij and G_ji (2-cycles) in the gate matrix.
-
     """
-    # Gates wie im forward konstruieren (mit Grad durch gate_logits!)
+    # Gates wie im forward konstruiert (mit Grad durch gate_logits!)
     G = torch.sigmoid(model.gate_logits) * model.gate_mask  # (C, C)
 
-    # Falls du später mal batched Gates hättest, könnte man das anpassen.
-    G_eff = G  # (C, C)
-
-    C = G_eff.shape[0]
-    device = G_eff.device
+    C = G.shape[0]
+    device = G.device
 
     eye = torch.eye(C, device=device)
     mask = 1.0 - eye  # 1 off-diagonal, 0 auf Diagonale
 
-    sym_strength = torch.abs(G_eff * G_eff.T) * mask
+    sym_strength = torch.abs(G * G.T) * mask
     loss = beta_cycle * 0.5 * sym_strength.sum()
     return loss
 
@@ -164,16 +264,16 @@ def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
     psp_np = psp.squeeze(0).cpu().numpy()     # (K, T)
     spike_np = spike_times.squeeze(0).cpu().numpy()  # (T,)
 
-    K, T = arr.shape
-    t_idx = np.arange(T)
+    K_, T_ = arr.shape
+    t_idx = np.arange(T_)
 
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(K, 1, figsize=(8, 3 * K), sharex=True)
-    if K == 1:
+    fig, axes = plt.subplots(K_, 1, figsize=(8, 3 * K_), sharex=True)
+    if K_ == 1:
         axes = [axes]
 
-    for k in range(K):
+    for k in range(K_):
         ax = axes[k]
 
         arrivals_k = arr[k, :]
@@ -215,8 +315,6 @@ def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
     plt.show()
 
 
-
-
 def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=0, window_idx=0):
     """
     Zeigt eine Tabelle mit:
@@ -252,8 +350,8 @@ def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=
     pot_np = pot.squeeze(0).cpu().numpy()              # (K,)
     arrivals_np = arrivals.squeeze(0).cpu().numpy()    # (K, T)
 
-    K = pot_np.shape[0]
-    T = len(lat)
+    K_ = pot_np.shape[0]
+    T_ = len(lat)
 
     import matplotlib.pyplot as plt
 
@@ -261,35 +359,35 @@ def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=
     ax.axis("off")
 
     # Spaltenüberschriften: t0..t(T-1) + pot
-    col_labels = [f"t{t}" for t in range(T)] + ["pot"]
+    col_labels = [f"t{t}" for t in range(T_)] + ["pot"]
 
     # Tabelle füllen
     table_data = []
 
     # Rohsignal
-    raw_row = [f"{raw[t]:.3f}" for t in range(T)] + ["-"]
+    raw_row = [f"{raw[t]:.3f}" for t in range(T_)] + ["-"]
     table_data.append(raw_row)
 
     # Latencies
-    lat_row = [f"{lat[t]:.2f}" for t in range(T)] + ["-"]
+    lat_row = [f"{lat[t]:.2f}" for t in range(T_)] + ["-"]
     table_data.append(lat_row)
 
     # Matcher k: arrivals, delays, weights + pot (nur bei arrivals)
     row_labels = ["raw", "latency"]
 
-    for k in range(K):
+    for k in range(K_):
         # Arrivals-Zeile + pot
-        arr_row = [f"{arrivals_np[k, t]:.2f}" for t in range(T)] + [f"{pot_np[k]:.3f}"]
+        arr_row = [f"{arrivals_np[k, t]:.2f}" for t in range(T_)] + [f"{pot_np[k]:.3f}"]
         table_data.append(arr_row)
         row_labels.append(f"arr {k}")
 
         # Delays-Zeile (kein pot)
-        del_row = [f"{delays[k, t]:.2f}" for t in range(T)] + ["-"]
+        del_row = [f"{delays[k, t]:.2f}" for t in range(T_)] + ["-"]
         table_data.append(del_row)
         row_labels.append(f"delay {k}")
 
         # Weights-Zeile (kein pot)
-        w_row = [f"{weights[k, t]:.2f}" for t in range(T)] + ["-"]
+        w_row = [f"{weights[k, t]:.2f}" for t in range(T_)] + ["-"]
         table_data.append(w_row)
         row_labels.append(f"w {k}")
 
@@ -313,7 +411,6 @@ def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=
 
     plt.tight_layout()
     plt.show()
-
 
 
 def plot_predicted_vs_true_latencies(model, lat_windows, channel_idx=0, window_idx=0):
@@ -350,20 +447,20 @@ def plot_delay_weight_history(delay_hist, weight_hist, channel_idx=0):
     delay_hist = np.array(delay_hist)  # shape (E, K, T)
     weight_hist = np.array(weight_hist)  # shape (E, K, T)
 
-    E, K, T = delay_hist.shape
+    E, K_, T_ = delay_hist.shape
 
     import matplotlib.pyplot as plt
 
     # --- Delays ---
-    fig, axes = plt.subplots(K, 1, figsize=(10, 2 * K), sharex=True)
-    if K == 1:
+    fig, axes = plt.subplots(K_, 1, figsize=(10, 2 * K_), sharex=True)
+    if K_ == 1:
         axes = [axes]
-    for k in range(K):
+    for k in range(K_):
         ax = axes[k]
         # Für jeden t (Zeitindex) eine Kurve über Epochen
-        for t in range(T):
+        for t in range(T_):
             ax.plot(delay_hist[:, k, t], alpha=0.7)
-        ax.set_title(f"Channel 0 – Matcher {k} – Delay evolution")
+        ax.set_title(f"Channel {channel_idx} – Matcher {k} – Delay evolution")
         ax.set_ylabel("delay")
         ax.grid(alpha=0.3)
     plt.xlabel("Epoch")
@@ -371,14 +468,14 @@ def plot_delay_weight_history(delay_hist, weight_hist, channel_idx=0):
     plt.show()
 
     # --- Weights ---
-    fig, axes = plt.subplots(K, 1, figsize=(10, 2 * K), sharex=True)
-    if K == 1:
+    fig, axes = plt.subplots(K_, 1, figsize=(10, 2 * K_), sharex=True)
+    if K_ == 1:
         axes = [axes]
-    for k in range(K):
+    for k in range(K_):
         ax = axes[k]
-        for t in range(T):
+        for t in range(T_):
             ax.plot(weight_hist[:, k, t], alpha=0.7)
-        ax.set_title(f"Channel 0 – Matcher {k} – Weight evolution")
+        ax.set_title(f"Channel {channel_idx} – Matcher {k} – Weight evolution")
         ax.set_ylabel("weight")
         ax.grid(alpha=0.3)
     plt.xlabel("Epoch")
@@ -432,7 +529,7 @@ for epoch in range(1, num_epochs+1):
         loss_cycle = cycle_suppression_loss(model, beta_cycle=10)
         loss = loss_pred + 0.01 * gate_reg + loss_cycle
         loss.backward()
-        print("delay grad norm:", model.matchers[0].delays.grad)
+        print("delay grad norm:", model.matchers[0].delays.grad.norm().item())
         optimizer.step()
         train_loss += loss.item() * batch_lat.size(0)
     train_loss /= len(train_ds)
@@ -478,10 +575,6 @@ plot_matcher_table_for_channel(
 plot_predicted_vs_true_latencies(model, train_lat, channel_idx=1, window_idx=5)
 plot_delay_weight_history(delay_history, weight_history, channel_idx=0)
 plot_arrivals_for_window(model, train_lat, channel_idx=0, window_idx=5)
-
-
-
-
 
 with torch.no_grad():
     preds_all, _ = model(train_lat[:6])

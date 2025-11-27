@@ -1,4 +1,5 @@
-# spiking_seq2seq_predictor.py
+# spiking_seq2seq_predictor_with_dendrites.py
+
 import torch, torch.nn as nn, torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
@@ -27,9 +28,9 @@ series = np.stack([X, Y, Z], axis=0)  # shape (channels, seq_len)
 
 # -------------------- Hankel windows and latency encoding --------------------
 def hankel_windows_multichannel(x, T, stride=1):
-    channels, L = x.shape
+    channels_, L = x.shape
     num_windows = (L - T) // stride + 1
-    out = np.zeros((num_windows, channels, T), dtype=x.dtype)
+    out = np.zeros((num_windows, channels_, T), dtype=x.dtype)
     idx = 0
     for i in range(0, L - T + 1, stride):
         out[idx] = x[:, i:i+T]
@@ -40,7 +41,7 @@ windows = hankel_windows_multichannel(series, T, stride=stride)  # (num_windows,
 num_windows = windows.shape[0]
 
 def magnitude_to_latency_batch(windows, t_min=0.0, t_max=40.0, eps=1e-8):
-    nw, ch, T = windows.shape
+    nw, ch, T_ = windows.shape
     lat = np.zeros_like(windows, dtype=float)
     for c in range(ch):
         vals = windows[:, c, :].reshape(-1)
@@ -63,22 +64,65 @@ class DendriticMatcherBank(nn.Module):
         self.T = T
         self.K = K
         self.w = nn.Parameter(torch.randn(K, T) * 0.2 + 0.5)
-        init = torch.linspace(T-1, 0, T).unsqueeze(0).repeat(K,1)
         self.delays = nn.Parameter(0.1 * torch.randn(K, T))
         self.tau = tau
 
     def forward(self, spike_times):  # spike_times: (B, T)
         B = spike_times.size(0)
-        st = spike_times.unsqueeze(1).expand(-1, self.K, -1)
-        delays = self.delays.unsqueeze(0).expand(B, -1, -1)
-        arrivals = st + delays  # (B, K, T)
-        t_ref, _ = torch.max(arrivals, dim=2, keepdim=True)  # (B, K, 1)
-        dt = torch.clamp(t_ref - arrivals, min=0.0)
-        #psp = torch.exp(-dt / self.tau)  # (B, K, T)
-        psp = torch.clamp(1.0 - dt / self.tau, min=0.0)
+        st = spike_times.unsqueeze(1).expand(-1, self.K, -1)      # (B, K, T)
+        delays = self.delays.unsqueeze(0).expand(B, -1, -1)       # (B, K, T)
+        arrivals = st + delays                                    # (B, K, T)
 
-        pot = torch.sum(self.w.unsqueeze(0) * psp, dim=2)  # (B, K)
+        t_ref, _ = torch.max(arrivals, dim=2, keepdim=True)       # (B, K, 1)
+        dt = torch.clamp(t_ref - arrivals, min=0.0)               # (B, K, T)
+
+        # PSP: linear falloff (statt exp), wie im Originalcode
+        psp = torch.clamp(1.0 - dt / self.tau, min=0.0)           # (B, K, T)
+
+        pot = torch.sum(self.w.unsqueeze(0) * psp, dim=2)         # (B, K)
         return pot, arrivals, psp
+
+
+class DendriticCombiner(nn.Module):
+    """
+    Nimmt pro Kanal die K Matcher-Potenziale (B, K)
+    und macht daraus einen dendritisch verarbeiteten Kanal-Output (B,).
+    Hier: K=6 -> 3 Subunits mit Paarung (0,1), (2,3), (4,5).
+    """
+    def __init__(self, K):
+        super().__init__()
+        assert K == 6, "DendriticCombiner ist aktuell für K=6 ausgelegt."
+        self.K = K
+        self.pairs = [(0, 1), (2, 3), (4, 5)]
+
+        # Gewichte für die 2 Eingänge pro Subunit (3 Subunits x 2 Inputs)
+        self.W2 = nn.Parameter(torch.randn(len(self.pairs), 2) * 0.2 + 0.5)
+
+        # Schwellen pro Subunit (NMDA-like)
+        self.threshold = nn.Parameter(torch.ones(len(self.pairs)) * 0.5)
+
+        # Soma-Gewichte für die 3 Subunits
+        self.soma_w = nn.Parameter(torch.ones(len(self.pairs)))
+
+    def forward(self, pots):  # pots: (B, K)
+        B, K = pots.shape
+        assert K == self.K
+
+        subunits = []
+        for s, (i, j) in enumerate(self.pairs):
+            # Lineare Kombination der beiden Äste
+            x = self.W2[s, 0] * pots[:, i] + self.W2[s, 1] * pots[:, j]
+            # NMDA-ähnliche Nichtlinearität
+            y = torch.relu(x - self.threshold[s]) ** 2
+            subunits.append(y)
+
+        # (B, 3)
+        subunits = torch.stack(subunits, dim=1)
+
+        # Soma: gewichtete Summe der Subunits -> (B,)
+        soma = torch.sum(self.soma_w.unsqueeze(0) * subunits, dim=1)
+        return soma  # (B,)
+
 
 class CrossPredictor(nn.Module):
     def __init__(self, in_dim, T):
@@ -91,59 +135,94 @@ class CrossPredictor(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+
 class FullModel(nn.Module):
     def __init__(self, channels, K, T):
         super().__init__()
         self.channels = channels
         self.K = K
         self.T = T
-        self.matchers = nn.ModuleList([DendriticMatcherBank(T, K) for _ in range(channels)])
+
+        # Matcher-Bank pro Kanal (wie vorher)
+        self.matchers = nn.ModuleList([
+            DendriticMatcherBank(T, K) for _ in range(channels)
+        ])
+
+        # Dendritische Kombiner pro Kanal:
+        # Matcher-Pots -> kanalweises Soma-Feature
+        self.dendritic_combiners = nn.ModuleList([
+            DendriticCombiner(K) for _ in range(channels)
+        ])
+
+        # Gates zwischen Kanälen (target x source), ohne Selbstkanten
         self.gate_logits = nn.Parameter(torch.randn(channels, channels) * 0.5)
         mask = torch.ones(channels, channels)
         for i in range(channels):
-            mask[i,i] = 0.0
+            mask[i, i] = 0.0
         self.register_buffer('gate_mask', mask)
-        self.predictors = nn.ModuleList([CrossPredictor(in_dim=K*channels, T=T) for _ in range(channels)])
+
+        # Predictor bekommt jetzt pro Zielkanal die kanalweise dendritischen
+        # Outputs ALLER Kanäle als Input -> in_dim = channels
+        self.predictors = nn.ModuleList([
+            CrossPredictor(in_dim=channels, T=T) for _ in range(channels)
+        ])
 
     def forward(self, latencies):  # latencies: (B, channels, T)
         B = latencies.size(0)
+
+        # 1) Matcher pro Kanal: Potenziale berechnen (wie vorher)
         pots = []
         for c in range(self.channels):
             pot, _, _ = self.matchers[c](latencies[:, c, :])  # (B, K)
             pots.append(pot)
-        pots_stacked = torch.stack(pots, dim=1)  # (B, channels, K)
+        pots_stacked = torch.stack(pots, dim=1)  # (B, channels, K)  (falls du es noch plotten willst)
+
+        # 2) Dendritischer Combiner pro Kanal:
+        #    aus (B, K) -> (B,) Kanal-Feature
+        dend_feats = []
+        for c in range(self.channels):
+            soma_out = self.dendritic_combiners[c](pots[c])  # (B,)
+            dend_feats.append(soma_out)
+        # (B, channels)
+        dend_feats = torch.stack(dend_feats, dim=1)
+
+        # 3) Gates berechnen (target x source, wie vorher)
         gates = torch.sigmoid(self.gate_logits) * self.gate_mask  # (channels, channels)
+
+        # 4) Pro Zielkanal: Kanal-Features mit Gates mischen und Predictor anwenden
         preds = []
         for tgt in range(self.channels):
-            g = gates[tgt].unsqueeze(0).unsqueeze(2)  # (1, channels, 1)
-            gated = pots_stacked * g  # (B, channels, K)
+            # g: (channels,) -> (1, channels)
+            g = gates[tgt].unsqueeze(0)  # (1, channels)
+
+            # kanalweise gewichtete Features: (B, channels)
+            gated = dend_feats * g  # Broadcasting auf Batch-Dim
+
+            # (B, channels) bleibt (B, channels)
             flat = gated.view(B, -1)
+
             pred = self.predictors[tgt](flat)  # (B, T)
             preds.append(pred)
+
         preds = torch.stack(preds, dim=1)  # (B, channels, T)
         return preds, gates
+
 
 #-----------Utilities----------
 def cycle_suppression_loss(model, beta_cycle=1e-3):
     """
     Penalizes symmetric connections G_ij and G_ji (2-cycles) in the gate matrix.
-
     """
-    # Gates wie im forward konstruieren (mit Grad durch gate_logits!)
     G = torch.sigmoid(model.gate_logits) * model.gate_mask  # (C, C)
+    C = G.shape[0]
 
-    # Falls du später mal batched Gates hättest, könnte man das anpassen.
-    G_eff = G  # (C, C)
-
-    C = G_eff.shape[0]
-    device = G_eff.device
-
-    eye = torch.eye(C, device=device)
+    eye = torch.eye(C, device=G.device)
     mask = 1.0 - eye  # 1 off-diagonal, 0 auf Diagonale
 
-    sym_strength = torch.abs(G_eff * G_eff.T) * mask
+    sym_strength = torch.abs(G * G.T) * mask
     loss = beta_cycle * 0.5 * sym_strength.sum()
     return loss
+
 
 #----------------Utilities-Plotting---------
 def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
@@ -164,16 +243,14 @@ def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
     psp_np = psp.squeeze(0).cpu().numpy()     # (K, T)
     spike_np = spike_times.squeeze(0).cpu().numpy()  # (T,)
 
-    K, T = arr.shape
-    t_idx = np.arange(T)
+    K_, T_ = arr.shape
+    t_idx = np.arange(T_)
 
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(K, 1, figsize=(8, 3 * K), sharex=True)
-    if K == 1:
+    fig, axes = plt.subplots(K_, 1, figsize=(8, 3 * K_), sharex=True)
+    if K_ == 1:
         axes = [axes]
 
-    for k in range(K):
+    for k in range(K_):
         ax = axes[k]
 
         arrivals_k = arr[k, :]
@@ -215,8 +292,6 @@ def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
     plt.show()
 
 
-
-
 def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=0, window_idx=0):
     """
     Zeigt eine Tabelle mit:
@@ -252,44 +327,42 @@ def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=
     pot_np = pot.squeeze(0).cpu().numpy()              # (K,)
     arrivals_np = arrivals.squeeze(0).cpu().numpy()    # (K, T)
 
-    K = pot_np.shape[0]
-    T = len(lat)
-
-    import matplotlib.pyplot as plt
+    K_ = pot_np.shape[0]
+    T_ = len(lat)
 
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.axis("off")
 
     # Spaltenüberschriften: t0..t(T-1) + pot
-    col_labels = [f"t{t}" for t in range(T)] + ["pot"]
+    col_labels = [f"t{t}" for t in range(T_)] + ["pot"]
 
     # Tabelle füllen
     table_data = []
 
     # Rohsignal
-    raw_row = [f"{raw[t]:.3f}" for t in range(T)] + ["-"]
+    raw_row = [f"{raw[t]:.3f}" for t in range(T_)] + ["-"]
     table_data.append(raw_row)
 
     # Latencies
-    lat_row = [f"{lat[t]:.2f}" for t in range(T)] + ["-"]
+    lat_row = [f"{lat[t]:.2f}" for t in range(T_)] + ["-"]
     table_data.append(lat_row)
 
     # Matcher k: arrivals, delays, weights + pot (nur bei arrivals)
     row_labels = ["raw", "latency"]
 
-    for k in range(K):
+    for k in range(K_):
         # Arrivals-Zeile + pot
-        arr_row = [f"{arrivals_np[k, t]:.2f}" for t in range(T)] + [f"{pot_np[k]:.3f}"]
+        arr_row = [f"{arrivals_np[k, t]:.2f}" for t in range(T_)] + [f"{pot_np[k]:.3f}"]
         table_data.append(arr_row)
         row_labels.append(f"arr {k}")
 
         # Delays-Zeile (kein pot)
-        del_row = [f"{delays[k, t]:.2f}" for t in range(T)] + ["-"]
+        del_row = [f"{delays[k, t]:.2f}" for t in range(T_)] + ["-"]
         table_data.append(del_row)
         row_labels.append(f"delay {k}")
 
         # Weights-Zeile (kein pot)
-        w_row = [f"{weights[k, t]:.2f}" for t in range(T)] + ["-"]
+        w_row = [f"{weights[k, t]:.2f}" for t in range(T_)] + ["-"]
         table_data.append(w_row)
         row_labels.append(f"w {k}")
 
@@ -315,7 +388,6 @@ def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=
     plt.show()
 
 
-
 def plot_predicted_vs_true_latencies(model, lat_windows, channel_idx=0, window_idx=0):
     """
     Plot für ein einziges Fenster und einen Kanal:
@@ -329,7 +401,6 @@ def plot_predicted_vs_true_latencies(model, lat_windows, channel_idx=0, window_i
     pred = preds[0, channel_idx].cpu().numpy()      # (T,)
     true = lat_windows[window_idx, channel_idx].cpu().numpy()  # (T,)
 
-    import matplotlib.pyplot as plt
     plt.figure(figsize=(8,4))
     plt.plot(true, label="true latencies", linewidth=2)
     plt.plot(pred, label="predicted latencies", linestyle="--")
@@ -350,20 +421,18 @@ def plot_delay_weight_history(delay_hist, weight_hist, channel_idx=0):
     delay_hist = np.array(delay_hist)  # shape (E, K, T)
     weight_hist = np.array(weight_hist)  # shape (E, K, T)
 
-    E, K, T = delay_hist.shape
-
-    import matplotlib.pyplot as plt
+    E, K_, T_ = delay_hist.shape
 
     # --- Delays ---
-    fig, axes = plt.subplots(K, 1, figsize=(10, 2 * K), sharex=True)
-    if K == 1:
+    fig, axes = plt.subplots(K_, 1, figsize=(10, 2 * K_), sharex=True)
+    if K_ == 1:
         axes = [axes]
-    for k in range(K):
+    for k in range(K_):
         ax = axes[k]
         # Für jeden t (Zeitindex) eine Kurve über Epochen
-        for t in range(T):
+        for t in range(T_):
             ax.plot(delay_hist[:, k, t], alpha=0.7)
-        ax.set_title(f"Channel 0 – Matcher {k} – Delay evolution")
+        ax.set_title(f"Channel {channel_idx} – Matcher {k} – Delay evolution")
         ax.set_ylabel("delay")
         ax.grid(alpha=0.3)
     plt.xlabel("Epoch")
@@ -371,14 +440,14 @@ def plot_delay_weight_history(delay_hist, weight_hist, channel_idx=0):
     plt.show()
 
     # --- Weights ---
-    fig, axes = plt.subplots(K, 1, figsize=(10, 2 * K), sharex=True)
-    if K == 1:
+    fig, axes = plt.subplots(K_, 1, figsize=(10, 2 * K_), sharex=True)
+    if K_ == 1:
         axes = [axes]
-    for k in range(K):
+    for k in range(K_):
         ax = axes[k]
-        for t in range(T):
+        for t in range(T_):
             ax.plot(weight_hist[:, k, t], alpha=0.7)
-        ax.set_title(f"Channel 0 – Matcher {k} – Weight evolution")
+        ax.set_title(f"Channel {channel_idx} – Matcher {k} – Weight evolution")
         ax.set_ylabel("weight")
         ax.grid(alpha=0.3)
     plt.xlabel("Epoch")
@@ -404,7 +473,7 @@ for name, p in model.named_parameters():
 optimizer = optim.Adam(
     [
         {"params": other_params, "lr": 3e-3},   # normale LR
-        {"params": delay_params, "lr": 1},   # höhere LR nur für delays
+        {"params": delay_params, "lr": 1},      # höhere LR nur für delays
     ]
 )
 
@@ -413,9 +482,9 @@ mse = nn.MSELoss()
 num_epochs = 500
 batch_size = 128
 
-
 delay_history = []   # numpy arrays shape (K, T)
 weight_history = []  # numpy arrays shape (K, T)
+
 train_ds = torch.utils.data.TensorDataset(train_lat)
 train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 val_ds = torch.utils.data.TensorDataset(val_lat)
@@ -432,10 +501,11 @@ for epoch in range(1, num_epochs+1):
         loss_cycle = cycle_suppression_loss(model, beta_cycle=10)
         loss = loss_pred + 0.01 * gate_reg + loss_cycle
         loss.backward()
-        print("delay grad norm:", model.matchers[0].delays.grad)
+        print("delay grad norm:", model.matchers[0].delays.grad.norm().item())
         optimizer.step()
         train_loss += loss.item() * batch_lat.size(0)
     train_loss /= len(train_ds)
+
     model.eval()
     with torch.no_grad():
         val_sum = 0.0
@@ -443,8 +513,10 @@ for epoch in range(1, num_epochs+1):
             pv, gv = model(bv)
             val_sum += mse(pv, bv).item() * bv.size(0)
         val_loss = val_sum / len(val_ds)
+
     if epoch % 10 == 0 or epoch == 1:
         print(f"Epoch {epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+
     with torch.no_grad():
         d = model.matchers[0].delays.detach().cpu().numpy().copy()
         w = model.matchers[0].w.detach().cpu().numpy().copy()
@@ -478,10 +550,6 @@ plot_matcher_table_for_channel(
 plot_predicted_vs_true_latencies(model, train_lat, channel_idx=1, window_idx=5)
 plot_delay_weight_history(delay_history, weight_history, channel_idx=0)
 plot_arrivals_for_window(model, train_lat, channel_idx=0, window_idx=5)
-
-
-
-
 
 with torch.no_grad():
     preds_all, _ = model(train_lat[:6])

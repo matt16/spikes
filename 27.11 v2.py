@@ -77,7 +77,7 @@ class DendriticMatcherBank(nn.Module):
         dt = torch.clamp(t_ref - arrivals, min=0.0)               # (B, K, T)
 
         # PSP: linear falloff (statt exp), wie im Originalcode
-        psp = torch.clamp(1.0 - dt / self.tau, min=0.0)           # (B, K, T)
+        psp = torch.exp(-dt / self.tau)                           # (B, K, T)
 
         pot = torch.sum(self.w.unsqueeze(0) * psp, dim=2)         # (B, K)
         return pot, arrivals, psp

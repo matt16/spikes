@@ -67,38 +67,32 @@ class DendriticMatcherBank(nn.Module):
         # Synaptische Gewichte pro "Zeit-Synapse"
         self.w = nn.Parameter(torch.randn(K, T) * 0.2 + 0.5)
 
-        # Delays wie gehabt
+        # Delays
         self.delays = nn.Parameter(0.1 * torch.randn(K, T))
 
         # PSP- und Membran-Konstanten
-        self.tau_psp = tau_psp    # für exp(-dt / tau_psp)
-        self.tau_mem = tau_mem    # für LIF
-        self.v_th = v_th          # (nicht mehr explizit genutzt, aber lass ihn da)
-        self.dt = dt              # Zeitschritt (hier diskret: 1.0)
+        self.tau_psp = tau_psp
+        self.tau_mem = tau_mem
+        self.v_th = v_th          # aktuell nicht genutzt
+        self.dt = dt
 
         # Temperatur für soft-argmax
         self.tau_soft = tau_soft
 
-    def forward(self, spike_times, return_spike_times: bool = False):
+    def forward(self, spike_times):
         """
-        spike_times: (B, T)  -- Latenzen / "Input-Spikezeiten" für dieses Fenster
-        return_spike_times: wenn True, zusätzlich Matcher-Spikezeiten zurückgeben
+        spike_times: (B, T)
 
-        Rückgabe (standard):
-            pot: (B, K)
-            arrivals: (B, K, T)
-            psp: (B, K, T)
-
-        Rückgabe (wenn return_spike_times=True):
-            pot, arrivals, psp, matcher_spike_times (B, K)
+        Rückgabe:
+            arrivals:            (B, K, T)
+            psp:                 (B, K, T)
+            matcher_spike_times: (B, K)
         """
         B = spike_times.size(0)
         device = spike_times.device
         T = self.T
 
-        # -----------------------------
-        # 1) Arrivals wie bisher
-        # -----------------------------
+        # 1) Arrivals
         st = spike_times.unsqueeze(1).expand(-1, self.K, -1)     # (B, K, T)
         delays = self.delays.unsqueeze(0).expand(B, -1, -1)      # (B, K, T)
         arrivals = st + delays                                   # (B, K, T)
@@ -106,28 +100,13 @@ class DendriticMatcherBank(nn.Module):
         t_ref, _ = torch.max(arrivals, dim=2, keepdim=True)      # (B, K, 1)
         dt = torch.clamp(t_ref - arrivals, min=0.0)              # (B, K, T)
 
-        # -----------------------------
         # 2) Exponentieller PSP-Kern
-        # -----------------------------
         psp = torch.exp(-dt / self.tau_psp)                      # (B, K, T)
 
         # Synaptischer "Strom": Gewicht * PSP
         I = self.w.unsqueeze(0) * psp                            # (B, K, T)
 
-        # -----------------------------
-        # 3) Matcher-"Potenzial" (Summe über Zeit)
-        # -----------------------------
-        pot = torch.sum(I, dim=2)                                # (B, K)
-
-        # -----------------------------
-        # 4) LIF + soft-argmax -> Spikezeit (optional)
-        # -----------------------------
-        # if not return_spike_times:
-        #     return pot, arrivals, psp
-
-        # LIF-Integration über T-Schritte: v-Trace speichern
-        # TODO
-        # v = torch.zeros_like(I)
+        # 3) LIF + soft-argmax -> Spikezeit
         v = torch.zeros(B, self.K, device=device)
         v_trace = []
 
@@ -139,36 +118,15 @@ class DendriticMatcherBank(nn.Module):
 
         v_trace = torch.cat(v_trace, dim=-1)                     # (B, K, T)
 
-        # soft-argmax über die Zeitachse
         time_axis = torch.arange(T, device=device).view(1, 1, T) * self.dt
         w_soft = torch.softmax(v_trace / self.tau_soft, dim=-1)  # (B, K, T)
         matcher_spike_times = (w_soft * time_axis).sum(dim=-1)   # (B, K)
 
-        return pot, arrivals, psp, matcher_spike_times
+        return arrivals, psp, matcher_spike_times
 
 
-# -------------------- Neuer 3-Level-Combiner pro Kanal --------------------
+# -------------------- Drei-Level-Combiner --------------------
 class ThreeLevelCombiner(nn.Module):
-    """
-    Drei-Level-Combiner für EINEN Kanal.
-
-    Input:
-        matcher_spike_times: (B, K)
-
-    Architektur:
-        L1: K -> K/2 Branches (je 2 Matcher-Spikes)
-             - passive LIF (kein Threshold)
-             - "Branch-Spikezeit" = soft-argmax über Membran
-
-        L2: K/2 -> n_L2 Branches
-             - jede L2-Branch liest alle L1-Branches (mit eigenen Gewichten)
-             - wieder passive LIF + soft-argmax
-
-        Soma: n_L2 -> 1 Spikezeit
-             - LIF ohne harte Schwelle
-             - Spikezeit = soft-argmax über v_soma(t)
-    """
-
     def __init__(
         self,
         K: int,
@@ -188,12 +146,11 @@ class ThreeLevelCombiner(nn.Module):
         tau_soft_soma: float = 1.0,
     ):
         super().__init__()
-        assert K % 2 == 0, "K muss gerade sein, um Paare für L1 bilden zu können."
+        assert K % 2 == 0, "K muss gerade sein."
         self.K = K
         self.n_L1 = K // 2
         self.n_L2 = n_L2
 
-        # Zeitdiskretisierung
         self.dt = dt
         self.t_max_L1 = t_max_L1
         self.t_max_L2 = t_max_L2
@@ -203,7 +160,6 @@ class ThreeLevelCombiner(nn.Module):
         self.n_steps_L2 = int(round(t_max_L2 / dt))
         self.n_steps_soma = int(round(t_max_soma / dt))
 
-        # Zeitkonstanten
         self.tau_syn_L1 = tau_syn_L1
         self.tau_mem_L1 = tau_mem_L1
         self.tau_syn_L2 = tau_syn_L2
@@ -211,28 +167,18 @@ class ThreeLevelCombiner(nn.Module):
         self.tau_syn_soma = tau_syn_soma
         self.tau_mem_soma = tau_mem_soma
 
-        # soft-argmax Temperaturen
         self.tau_soft_L1 = tau_soft_L1
         self.tau_soft_L2 = tau_soft_L2
         self.tau_soft_soma = tau_soft_soma
 
-        # L1-Gewichte: jede L1-Branch hat 2 Eingänge (2 Matcher)
-        # Shape: (n_L1, 2)
         self.W_L1 = nn.Parameter(
             torch.ones(self.n_L1, 2) + 0.1 * torch.randn(self.n_L1, 2)
         )
-
-        # L2-Gewichte: jede L2-Branch liest alle n_L1 L1-Branches
-        # Shape: (n_L2, n_L1)
         self.W_L2 = nn.Parameter(
             torch.ones(self.n_L2, self.n_L1) + 0.1 * torch.randn(self.n_L2, self.n_L1)
         )
-
-        # Soma-Gewichte: jede L2-Branch -> Soma
-        # Shape: (n_L2,)
         self.W_soma = nn.Parameter(torch.ones(self.n_L2))
 
-        # Matcher-Paare für L1: (0,1), (2,3), ...
         idx0 = torch.arange(0, K, 2)
         idx1 = idx0 + 1
         self.register_buffer("idx_L1_0", idx0)
@@ -244,35 +190,20 @@ class ThreeLevelCombiner(nn.Module):
         return torch.exp(-dt / tau_syn) * mask
 
     def _soft_argmax_time(self, v_trace, dt, tau_soft, dim=-1):
-        """
-        v_trace: (..., T)
-        Rückgabe: (...,)  – erwartete Zeit auf Basis softmax(v/tau_soft)
-        """
         T = v_trace.size(dim)
         device = v_trace.device
         time_axis = torch.arange(T, device=device, dtype=v_trace.dtype)
-        # bring time_axis in richtige Form zum Broadcasten
         while time_axis.dim() < v_trace.dim():
             time_axis = time_axis.unsqueeze(0)
         w = torch.softmax(v_trace / tau_soft, dim=dim)
         return (w * (time_axis * dt)).sum(dim=dim)
 
     def forward(self, matcher_spike_times):
-        """
-        matcher_spike_times: (B, K)
-
-        Rückgabe:
-            soma_spike_times: (B,)
-            L1_spike_times:   (B, n_L1)
-            L2_spike_times:   (B, n_L2)
-        """
         B, K = matcher_spike_times.shape
-        assert K == self.K, "K im Combiner und K im Input müssen übereinstimmen."
+        assert K == self.K
         device = matcher_spike_times.device
 
-        # ================================
-        # L1: K Matcher -> n_L1 Branches
-        # ================================
+        # L1
         t0 = matcher_spike_times[:, self.idx_L1_0]  # (B, n_L1)
         t1 = matcher_spike_times[:, self.idx_L1_1]  # (B, n_L1)
         L1_inputs = torch.stack([t0, t1], dim=-1)   # (B, n_L1, 2)
@@ -296,9 +227,7 @@ class ThreeLevelCombiner(nn.Module):
             v_L1_trace, dt=self.dt, tau_soft=self.tau_soft_L1, dim=-1
         )                                                       # (B, n_L1)
 
-        # ================================
-        # L2: n_L1 Branches -> n_L2 Branches
-        # ================================
+        # L2
         L2_inputs = L1_spike_times.unsqueeze(1).expand(B, self.n_L2, self.n_L1)
 
         v_L2 = torch.zeros(B, self.n_L2, device=device)
@@ -320,9 +249,7 @@ class ThreeLevelCombiner(nn.Module):
             v_L2_trace, dt=self.dt, tau_soft=self.tau_soft_L2, dim=-1
         )                                                           # (B, n_L2)
 
-        # ================================
-        # Soma: n_L2 -> 1 Spikezeit via soft-argmax
-        # ================================
+        # Soma
         v_soma = torch.zeros(B, device=device)
         v_soma_trace = []
 
@@ -349,7 +276,7 @@ class ThreeLevelCombiner(nn.Module):
         return soma_spike_times, L1_spike_times, L2_spike_times
 
 
-# -------------------- FullModel mit neuem Combiner & Cross-LIF --------------------
+# -------------------- FullModel --------------------
 class FullModel(nn.Module):
     def __init__(self, channels, K, T, n_L2=2):
         super().__init__()
@@ -357,56 +284,42 @@ class FullModel(nn.Module):
         self.K = K
         self.T = T
 
-        # Matcher-Bank pro Kanal
         self.matchers = nn.ModuleList([
             DendriticMatcherBank(T, K) for _ in range(channels)
         ])
-
-        # Neuer dendritischer 3-Level-Combiner pro Kanal
         self.combiners = nn.ModuleList([
             ThreeLevelCombiner(K=K, n_L2=n_L2) for _ in range(channels)
         ])
 
-        # Gates zwischen Kanälen (target x source), ohne Selbstkanten
         self.gate_logits = nn.Parameter(torch.randn(channels, channels) * 0.5)
         mask = torch.ones(channels, channels)
         for i in range(channels):
             mask[i, i] = 0.0
         self.register_buffer('gate_mask', mask)
 
-        # Cross-Channel-LIF-Parameter (zweite Schicht)
         self.cross_dt = 1.0
         self.cross_t_max = 80.0
         self.cross_n_steps = int(round(self.cross_t_max / self.cross_dt))
         self.cross_tau_syn = 10.0
         self.cross_tau_mem = 20.0
-        self.cross_threshold = 1.0  # nicht mehr für harte Schwelle genutzt
-        self.cross_tau_soft = 1.0   # Temperatur für soft-argmax
+        self.cross_threshold = 1.0
+        self.cross_tau_soft = 1.0
 
     def forward(self, latencies):  # latencies: (B, channels, T)
         B = latencies.size(0)
-        device = latencies.device
 
-        # 1) Matcher + Combiner pro Kanal: Soma-Spikezeit lokal
         soma_list = []
         for c in range(self.channels):
-            pot, _, _, matcher_spikes = self.matchers[c](
-                latencies[:, c, :],
-                return_spike_times=True
-            )  # matcher_spikes: (B, K)
-
-            soma_t, _, _ = self.combiners[c](matcher_spikes)  # (B,)
+            _, _, matcher_spikes = self.matchers[c](latencies[:, c, :])  # (B, K)
+            soma_t, _, _ = self.combiners[c](matcher_spikes)             # (B,)
             soma_list.append(soma_t)
 
         soma_times = torch.stack(soma_list, dim=1)  # (B, channels)
 
-        # 2) Gates (target x source)
         gates = torch.sigmoid(self.gate_logits) * self.gate_mask  # (C, C)
 
-        # 3) Cross-Channel-LIF: aus Soma-Spikes der anderen Kanäle
-        #    die Soma-Spikezeit des Zielkanals rekonstruieren (soft-argmax)
         C = self.channels
-        v = torch.zeros(B, C, device=device)
+        v = torch.zeros(B, C, device=latencies.device)
         v_trace = []
 
         for step in range(self.cross_n_steps):
@@ -416,7 +329,6 @@ class FullModel(nn.Module):
             mask_psp = (dt_mat >= 0).float()
             psp = torch.exp(-dt_mat / self.cross_tau_syn) * mask_psp  # (B, C)
 
-            # I[b, tgt] = sum_src psp[b, src] * gates[tgt, src]
             I = psp @ gates.t()   # (B, C)
 
             dv = (-v + I) * (self.cross_dt / self.cross_tau_mem)
@@ -425,29 +337,21 @@ class FullModel(nn.Module):
 
         v_trace = torch.cat(v_trace, dim=-1)    # (B, C, cross_n_steps)
 
-        # soft-argmax über die Zeitachse
         T_cross = self.cross_n_steps
-        time_axis = torch.arange(T_cross, device=device).view(1, 1, T_cross) * self.cross_dt
+        time_axis = torch.arange(T_cross, device=latencies.device).view(1, 1, T_cross) * self.cross_dt
         w_soft = torch.softmax(v_trace / self.cross_tau_soft, dim=-1)   # (B, C, T_cross)
         recon_soma_times = (w_soft * time_axis).sum(dim=-1)             # (B, C)
 
-        # Rückgabe:
-        #  - rekonstruierte Soma-Spikezeiten aus Cross-Channel-LIF
-        #  - Gates
-        #  - originale Soma-Spikezeiten (für Loss / Debug)
         return recon_soma_times, gates, soma_times
 
 
 #-----------Utilities----------
 def cycle_suppression_loss(model, beta_cycle=1e-3):
-    """
-    Penalizes symmetric connections G_ij and G_ji (2-cycles) in the gate matrix.
-    """
     G = torch.sigmoid(model.gate_logits) * model.gate_mask  # (C, C)
     C = G.shape[0]
 
     eye = torch.eye(C, device=G.device)
-    mask = 1.0 - eye  # 1 off-diagonal, 0 auf Diagonale
+    mask = 1.0 - eye
 
     sym_strength = torch.abs(G * G.T) * mask
     loss = beta_cycle * 0.5 * sym_strength.sum()
@@ -456,17 +360,11 @@ def cycle_suppression_loss(model, beta_cycle=1e-3):
 
 #----------------Utilities-Plotting---------
 def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
-    """
-    Für ein Fenster:
-      - arrivals pro Matcher
-      - spike_times (Input)
-      - psp pro Matcher (eigene y-Achse, da viel kleiner)
-    """
     model.eval()
     with torch.no_grad():
         spike_times = lat_windows[window_idx, channel_idx, :].unsqueeze(0)  # (1, T)
         matcher = model.matchers[channel_idx]
-        pot, arrivals, psp = matcher(spike_times)  # arrivals: (1, K, T), psp: (1, K, T)
+        arrivals, psp, matcher_spikes = matcher(spike_times)  # (1, K, T), (1, K, T), (1, K)
 
     arr = arrivals.squeeze(0).cpu().numpy()   # (K, T)
     psp_np = psp.squeeze(0).cpu().numpy()     # (K, T)
@@ -485,15 +383,12 @@ def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
         arrivals_k = arr[k, :]
         psp_k = psp_np[k, :]
 
-        # --- LEFT AXIS: arrivals + spike_times ---
         ax.scatter(t_idx, arrivals_k, s=30, label="arrival(t)")
         ax.plot(t_idx, arrivals_k, alpha=0.6)
 
-        # spike_times
         ax.plot(t_idx, spike_np, linestyle="--", linewidth=1.5,
                 label="spike_times")
 
-        # mean arrival
         mean_val = arrivals_k.mean()
         ax.axhline(mean_val, linestyle=":", linewidth=2,
                    label=f"mean={mean_val:.2f}")
@@ -502,15 +397,12 @@ def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
         ax.set_title(f"Channel {channel_idx}, Window {window_idx} – Matcher {k}")
         ax.grid(alpha=0.3)
 
-        # --- RIGHT AXIS: PSP values ---
         ax2 = ax.twinx()
-        ax2.plot(t_idx, psp_k, color="tab:red", linewidth=1.5,
-                 label="psp(t)")
-        ax2.set_ylabel("psp", color="tab:red")
-        ax2.tick_params(axis='y', labelcolor='tab:red')
-        ax2.set_ylim(0, max(psp_k)*1.2 + 1e-3)  # etwas Luft nach oben
+        ax2.plot(t_idx, psp_k, linewidth=1.5, label="psp(t)")
+        ax2.set_ylabel("psp")
+        ax2.tick_params(axis='y')
+        ax2.set_ylim(0, max(psp_k)*1.2 + 1e-3)
 
-        # Combined Legend (left + right sides)
         lines_left, labels_left = ax.get_legend_handles_labels()
         lines_right, labels_right = ax2.get_legend_handles_labels()
         ax.legend(lines_left + lines_right, labels_left + labels_right,
@@ -524,73 +416,57 @@ def plot_arrivals_for_window(model, lat_windows, channel_idx=0, window_idx=5):
 def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=0, window_idx=0):
     """
     Zeigt eine Tabelle mit:
-      - Rohsignal (raw input)
-      - Latencies (encodierte Spikezeiten)
-      - Pro Matcher k:
-          * Arrivals[k, :]
-          * Delays[k, :]
-          * Weights w[k, :]
-          * pot[k] (nur bei arrivals)
+      - Rohsignal
+      - Latencies
+      - Pro Matcher k: Arrivals, Delays, Weights
     """
-    # --- Rohsignal holen ---
     if isinstance(raw_windows, torch.Tensor):
         raw = raw_windows[window_idx, channel_idx, :].detach().cpu().numpy()
     else:
         raw = raw_windows[window_idx, channel_idx, :]
 
-    # --- Latencies aus Tensor ---
     lat = lat_windows[window_idx, channel_idx, :].detach().cpu().numpy()
 
-    # --- Matcher durchlaufen ---
     model.eval()
     with torch.no_grad():
         spike_times = lat_windows[window_idx, channel_idx, :].unsqueeze(0)  # (1, T)
         matcher = model.matchers[channel_idx]
-        pot, arrivals, _ = matcher(spike_times)
+        arrivals, _, _ = matcher(spike_times)
 
-        # delays & weights direkt aus dem Matcher
         delays = matcher.delays.detach().cpu().numpy()   # (K, T)
         weights = matcher.w.detach().cpu().numpy()       # (K, T)
 
-    pot_np = pot.squeeze(0).cpu().numpy()              # (K,)
     arrivals_np = arrivals.squeeze(0).cpu().numpy()    # (K, T)
 
-    K_ = pot_np.shape[0]
+    K_ = arrivals_np.shape[0]
     T_ = len(lat)
 
     fig, ax = plt.subplots(figsize=(14, 6))
     ax.axis("off")
 
-    # Spaltenüberschriften: t0..t(T-1) + pot
-    col_labels = [f"t{t}" for t in range(T_)] + ["pot"]
+    col_labels = [f"t{t}" for t in range(T_)]
 
-    # Tabelle füllen
     table_data = []
+    row_labels = []
 
-    # Rohsignal
-    raw_row = [f"{raw[t]:.3f}" for t in range(T_)] + ["-"]
+    raw_row = [f"{raw[t]:.3f}" for t in range(T_)]
     table_data.append(raw_row)
+    row_labels.append("raw")
 
-    # Latencies
-    lat_row = [f"{lat[t]:.2f}" for t in range(T_)] + ["-"]
+    lat_row = [f"{lat[t]:.2f}" for t in range(T_)]
     table_data.append(lat_row)
-
-    # Matcher k: arrivals, delays, weights + pot (nur bei arrivals)
-    row_labels = ["raw", "latency"]
+    row_labels.append("latency")
 
     for k in range(K_):
-        # Arrivals-Zeile + pot
-        arr_row = [f"{arrivals_np[k, t]:.2f}" for t in range(T_)] + [f"{pot_np[k]:.3f}"]
+        arr_row = [f"{arrivals_np[k, t]:.2f}" for t in range(T_)]
         table_data.append(arr_row)
         row_labels.append(f"arr {k}")
 
-        # Delays-Zeile (kein pot)
-        del_row = [f"{delays[k, t]:.2f}" for t in range(T_)] + ["-"]
+        del_row = [f"{delays[k, t]:.2f}" for t in range(T_)]
         table_data.append(del_row)
         row_labels.append(f"delay {k}")
 
-        # Weights-Zeile (kein pot)
-        w_row = [f"{weights[k, t]:.2f}" for t in range(T_)] + ["-"]
+        w_row = [f"{weights[k, t]:.2f}" for t in range(T_)]
         table_data.append(w_row)
         row_labels.append(f"w {k}")
 
@@ -608,7 +484,7 @@ def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=
 
     ax.set_title(
         f"Kanal {channel_idx}, Fenster {window_idx}\n"
-        f"Rohsignal + Latenzen + Matcher: Arrivals / Delays / Weights + Pot",
+        f"Rohsignal + Latenzen + Matcher: Arrivals / Delays / Weights",
         fontsize=12
     )
 
@@ -617,10 +493,6 @@ def plot_matcher_table_for_channel(model, raw_windows, lat_windows, channel_idx=
 
 
 def plot_predicted_vs_true_latencies(model, lat_windows, channel_idx=0, window_idx=0):
-    """
-    Angepasst: wir plotten jetzt "true vs reconstructed" Soma-Spikezeit
-    für EIN Fenster und EINEN Kanal.
-    """
     model.eval()
     with torch.no_grad():
         recon_soma, _, soma_orig = model(lat_windows[window_idx:window_idx+1])  # (1, C), (1, C)
@@ -638,16 +510,11 @@ def plot_predicted_vs_true_latencies(model, lat_windows, channel_idx=0, window_i
 
 
 def plot_delay_weight_history(delay_hist, weight_hist, channel_idx=0):
-    """
-    delay_hist: Liste von (K,T) Arrays über Epochen
-    weight_hist: Liste von (K,T) Arrays über Epochen
-    """
-    delay_hist = np.array(delay_hist)  # shape (E, K, T)
-    weight_hist = np.array(weight_hist)  # shape (E, K, T)
+    delay_hist = np.array(delay_hist)  # (E, K, T)
+    weight_hist = np.array(weight_hist)
 
     E, K_, T_ = delay_hist.shape
 
-    # --- Delays ---
     fig, axes = plt.subplots(K_, 1, figsize=(10, 2 * K_), sharex=True)
     if K_ == 1:
         axes = [axes]
@@ -662,7 +529,6 @@ def plot_delay_weight_history(delay_hist, weight_hist, channel_idx=0):
     plt.tight_layout()
     plt.show()
 
-    # --- Weights ---
     fig, axes = plt.subplots(K_, 1, figsize=(10, 2 * K_), sharex=True)
     if K_ == 1:
         axes = [axes]
@@ -681,7 +547,6 @@ def plot_delay_weight_history(delay_hist, weight_hist, channel_idx=0):
 # -------------------- Instantiate and train --------------------
 model = FullModel(channels=channels, K=K, T=T)
 
-# --- Parameter-Gruppen: delays vs. Rest ---
 delay_params = []
 other_params = []
 
@@ -695,8 +560,8 @@ for name, p in model.named_parameters():
 
 optimizer = optim.Adam(
     [
-        {"params": other_params, "lr": 3e-3},   # normale LR
-        {"params": delay_params, "lr": 1},      # höhere LR nur für delays
+        {"params": other_params, "lr": 3e-3},
+        {"params": delay_params, "lr": 1},
     ]
 )
 
@@ -705,8 +570,8 @@ mse = nn.MSELoss()
 num_epochs = 500
 batch_size = 128
 
-delay_history = []   # numpy arrays shape (K, T)
-weight_history = []  # numpy arrays shape (K, T)
+delay_history = []
+weight_history = []
 
 train_ds = torch.utils.data.TensorDataset(train_lat)
 train_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
@@ -720,9 +585,7 @@ for epoch in range(1, num_epochs+1):
         optimizer.zero_grad()
         recon_soma, gates, soma_orig = model(batch_lat)
 
-        # neue Loss: rekonstruiere Soma-Spikezeiten aus den anderen Kanälen
         loss_pred = mse(recon_soma, soma_orig)
-
         gate_reg = torch.mean(torch.abs(gates))
         loss_cycle = cycle_suppression_loss(model, beta_cycle=10)
         loss = loss_pred + 0.01 * gate_reg + loss_cycle
@@ -772,8 +635,8 @@ plt.show()
 
 plot_matcher_table_for_channel(
     model,
-    windows,      # ROHINPUT
-    train_lat,    # LATENZEN
+    windows,
+    train_lat,
     channel_idx=0,
     window_idx=5
 )

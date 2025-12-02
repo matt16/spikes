@@ -117,15 +117,17 @@ class DendriticMatcherBank(nn.Module):
         # -----------------------------
         # 3) Matcher-"Potenzial" (Summe über Zeit)
         # -----------------------------
-        pot = torch.sum(I, dim=2)                                # (B, K)
+        # pot = torch.sum(I, dim=2)                                # (B, K)
 
         # -----------------------------
         # 4) LIF + soft-argmax -> Spikezeit (optional)
         # -----------------------------
-        if not return_spike_times:
-            return pot, arrivals, psp
+        # if not return_spike_times:
+        #     return pot, arrivals, psp
 
         # LIF-Integration über T-Schritte: v-Trace speichern
+        # TODO
+        # v = torch.zeros_like(I)
         v = torch.zeros(B, self.K, device=device)
         v_trace = []
 

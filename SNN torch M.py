@@ -5,7 +5,8 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
 # ------------------------------------------------------------
-# 1. Strict backward-looking Hankel (sliding window) # ------------------------------------------------------------
+# 1. Strict backward-looking Hankel (sliding window)
+# ------------------------------------------------------------
 def hankel_backward(x, T):
     """
     x: [B, L] time series
@@ -18,7 +19,8 @@ def hankel_backward(x, T):
     return torch.stack(xs, dim=1)
 
 # ------------------------------------------------------------
-# 2. Surrogate LIF ODE + latency extraction # ------------------------------------------------------------
+# 2. Surrogate LIF ODE + latency extraction
+# ------------------------------------------------------------
 class LIF(nn.Module):
     def __init__(self, tau=20.0, threshold=1.0):
         super().__init__()

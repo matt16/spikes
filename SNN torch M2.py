@@ -1,16 +1,17 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-# ------------------------------------------------------------
-# 1. Strict backward-looking Hankel (sliding window)
-# ------------------------------------------------------------
+# ============================================================
+# 1) Strict backward-looking Hankel (sliding window)
+# ============================================================
 def hankel_backward(x, T):
     """
-    x: [B, L] time series
-    returns H: [B, L-T+1, T] windows ending at each time step
+    x: [B, L]
+    Return windows ending at each time step:
+    H[b, t] = x[b, t-T : t]
+    Shape: [B, L-T+1, T]
     """
     B,L = x.shape
     xs = []
@@ -18,9 +19,21 @@ def hankel_backward(x, T):
         xs.append(x[:, i-T:i])
     return torch.stack(xs, dim=1)
 
-# ------------------------------------------------------------
-# 2. Surrogate LIF ODE + latency extraction
-# ------------------------------------------------------------
+
+# ============================================================
+# 1a) Helper
+# ============================================================
+def soft_lat(spikes):
+    # spikes: [B, L] with surrogate sigmoid spikes
+    L = spikes.shape[1]
+    time = torch.arange(L, device=spikes.device, dtype=spikes.dtype)
+    w = spikes / (spikes.sum(dim=1, keepdim=True) + 1e-6)
+    return (w * time).sum(dim=1)
+
+
+# ============================================================
+# 2) Surrogate LIF ODE + latency extraction
+# ============================================================
 class LIF(nn.Module):
     def __init__(self, tau=20.0, threshold=1.0):
         super().__init__()
@@ -29,90 +42,98 @@ class LIF(nn.Module):
 
     def forward(self, I):
         """
-        I: [B, L] dendritic max-current over time
-        Uses simple Euler ODE: dv/dt = -v/tau + I
-        Surrogate spike: s = sigmoid(k*(v-th))
-        Latency = first time index where s > 0.5
+        I: [B, L]
+        Euler ODE: dv = dt*(-v/tau + I)
+        Surrogate spike = sigmoid(k*(v-th))
+        Reset v ← v*(1 - stopgrad(spike)).
         """
         B,L = I.shape
         v = torch.zeros(B)
         spikes = torch.zeros(B, L)
         k = 10.0
         for t in range(L):
-            dv = (-v/self.tau + I[:,t])
+            dv = -v/self.tau + I[:,t]
             v = v + dv
-            s = torch.sigmoid(k*(v - self.th))   # surrogate spike
+            s = torch.sigmoid(k*(v - self.th))
             spikes[:,t] = s
-            v = v * (1 - s.detach())             # reset
-        # latency per batch element
-        latency = spikes.argmax(dim=1)
-        return spikes, latency
+            v = v * (1 - s.detach())  # reset using stop-grad
 
-# ------------------------------------------------------------
-# 3. Deep dendritic block
-# ------------------------------------------------------------
+        hard_latency = spikes.argmax(dim=1)   # int, no-grad
+        soft_latency = soft_lat(spikes)   # float, differentiable
+        return spikes, hard_latency, soft_latency
+
+
+# ============================================================
+# 3) Deep dendrites with SOFTMAX surrogate competition
+# ============================================================
 class DeepDendrites(nn.Module):
+    """
+    Hard max(d2) is NOT differentiable.
+    → replaced with softmax-weighted dendritic sum (surrogate).
+    Still returns argmax for interpretability.
+    """
     def __init__(self, T, K1=16, K2=8):
         super().__init__()
-        self.T = T
-        self.K1 = K1
-        self.K2 = K2
         self.W1 = nn.Linear(T, K1)
         self.W2 = nn.Linear(K1, K2)
 
     def forward(self, H):
         """
-        H: [B, L, T] windows
-        returns:
-          dendritic_output: [B, L, K2]
-          winner_idx:       [B, L]
-          winner_vals:      [B, L]
+        H: [B, L, T]
+        d1: [B, L, K1]
+        d2: [B, L, K2]
+        soft_w: [B, L, K2] softmax over dendrites
+        soma_input: softmax-weighted sum over dendrites
         """
-        d1 = torch.relu(self.W1(H))          # layer 1 dendrites
-        d2 = torch.relu(self.W2(d1))         # layer 2 dendrites
-        vals, idx = d2.max(dim=-1)           # dendritic competition
-        return d2, idx, vals
+        d1 = torch.relu(self.W1(H))
+        d2 = torch.relu(self.W2(d1))
 
-# ------------------------------------------------------------
-# 4. Full self-supervised predictor
-# ------------------------------------------------------------
+        # surrogate competition
+        soft_w = torch.softmax(d2, dim=-1)  # differentiable
+        soma_in = (soft_w * d2).sum(dim=-1) # [B, L]
+
+        # still return discrete winner for diagnostics
+        vals, idx = d2.max(dim=-1)
+        return d2, idx, vals, soma_in
+
+
+# ============================================================
+# 4) Full self-supervised latency predictor
+# ============================================================
 class LatencyPredictor(nn.Module):
+    """
+    Two channels (A,B) supervise each other:
+    Loss = |latA - latB|.
+    """
     def __init__(self, T, K1=16, K2=8):
         super().__init__()
-        self.T = T
         self.encA = DeepDendrites(T, K1, K2)
         self.encB = DeepDendrites(T, K1, K2)
         self.lifA = LIF()
         self.lifB = LIF()
+        self.T = T
 
     def forward(self, xa, xb):
-        # sliding windows
-        Ha = hankel_backward(xa, self.T)   # [B, L-T+1, T]
+        Ha = hankel_backward(xa, self.T)
         Hb = hankel_backward(xb, self.T)
+        da, ida, vala, Ia = self.encA(Ha)
+        db, idb, valb, Ib = self.encB(Hb)
+        sa, la_hard, la_soft = self.lifA(Ia)
+        sb, lb_hard, lb_soft = self.lifB(Ib)
 
-        # deep dendrites
-        da, ida, vala = self.encA(Ha)
-        db, idb, valb = self.encB(Hb)
+        return (da, ida, vala, la_hard, la_soft), (db, idb, valb, lb_hard, lb_soft)
 
-        # soma input = max dendrite per step
-        Ia = vala
-        Ib = valb
 
-        # LIF
-        sa, la = self.lifA(Ia)
-        sb, lb = self.lifB(Ib)
-
-        return (da, ida, vala, la), (db, idb, valb, lb)
-
-# ------------------------------------------------------------
-# 5. Loss = |latencyA - latencyB|
-# ------------------------------------------------------------
+# ============================================================
+# 5) Latency-matching loss
+# ============================================================
 def latency_loss(la, lb):
-    return torch.mean(torch.abs(la - lb))
+    return torch.mean(torch.abs(la.float() - lb.float()))
 
-# ------------------------------------------------------------
-# 6. Visualization utilities
-# ------------------------------------------------------------
+
+# ============================================================
+# 6) Visualization utilities
+# ============================================================
 def plot_winners(time, winner_idx):
     plt.figure(figsize=(8,3))
     plt.plot(time, winner_idx, lw=1)
@@ -123,10 +144,9 @@ def plot_winners(time, winner_idx):
 
 def plot_dendrite_io(time, x, dendritic_outputs):
     """
-    x: [L] input signal
-    dendritic_outputs: [L, K2]
-    Show input (red) and dendritic output (blue)
-    Two-column grid, 1 row per dendrite.
+    Per-dendrite visualization:
+    Left column: input segment
+    Right column: dendritic filtered output
     """
     L, K2 = dendritic_outputs.shape
     fig, axes = plt.subplots(K2, 2, figsize=(10, 2*K2))
@@ -139,31 +159,41 @@ def plot_dendrite_io(time, x, dendritic_outputs):
 
     plt.tight_layout()
 
-# ------------------------------------------------------------
-# 7. Training sketch (sine + noise → predict clean sine)
-# ------------------------------------------------------------
 
-model = LatencyPredictor(T=20)
+# ============================================================
+# 7) Training loop (expanded + commented)
+# ============================================================
+model = LatencyPredictor(T=20, K1=32, K2=12)
 opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-for step in range(200):
-    t = torch.linspace(0, 2*3.14, 200).unsqueeze(0)
+for step in range(2000):
+
+    # ---- generate synthetic self-supervised pair ----
+    t = torch.linspace(0, 4*3.14, 400).unsqueeze(0)
     clean = torch.sin(t)
     noisy = clean + 0.2*torch.randn_like(clean)
 
-    (da, ida, vala, la), (db, idb, valb, lb) = model(noisy, clean)
-    loss = latency_loss(la, lb)
+    # ---- forward pass ----
+    (da, ida, vala, la_hard, la_soft), (db, idb, valb, lb_hard, lb_soft) = model(noisy, clean)
 
+    # ---- compute latency-based self-supervised loss ----
+    loss = latency_loss(la_soft, lb_soft)
+
+    # ---- optimize ----
     opt.zero_grad()
     loss.backward()
     opt.step()
 
-# ------------------------------------------------------------
-# Usage sketch for visualization
-# ------------------------------------------------------------
-# After forward pass:
-# time axis matching Hankel output length
+    if step % 200 == 0:
+        print(step, float(loss))
 
-time = t[0, -vala.shape[1]:]
+# ============================================================
+# 8) Visualization usage
+# ============================================================
+# Example after training:
+L_vis = vala.shape[1]    # segment length after Hankel
+time = t[0, -L_vis:]     # match Hankel-aligned end of time
+
 plot_winners(time, ida[0])
-plot_dendrite_io(time, noisy[0, -vala.shape[1]:], da[0])
+plot_dendrite_io(time, noisy[0, -L_vis:], da[0])
+

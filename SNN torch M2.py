@@ -46,19 +46,34 @@ class LIF(nn.Module):
         Euler ODE: dv = dt*(-v/tau + I)
         Surrogate spike = sigmoid(k*(v-th))
         Reset v ← v*(1 - stopgrad(spike)).
+        Returns spike raster and latency of first spike.
         """
         B,L = I.shape
         v = torch.zeros(B)
         spikes = torch.zeros(B, L)
+        hard_spikes = torch.zeros(B, L)  # binary spike raster
         k = 10.0
         for t in range(L):
             dv = -v/self.tau + I[:,t]
             v = v + dv
-            s = torch.sigmoid(k*(v - self.th))
+            s = torch.sigmoid(k*(v - self.th))  # soft surrogate spike
             spikes[:,t] = s
-            v = v * (1 - s.detach())  # reset using stop-grad
+            
+            # Hard spike: threshold the surrogate (detached for gradient flow)
+            hard_spike = (v.detach() > self.th).float()
+            hard_spikes[:,t] = hard_spike
+            
+            v = v * (1 - s.detach())  # reset using stop-grad from surrogate
 
-        hard_latency = spikes.argmax(dim=1)   # int, no-grad
+        # Find first spike time (hard latency)
+        first_spikes = (hard_spikes > 0.5).int()
+        first_spike_times = torch.full((B,), L, dtype=torch.long)
+        for b in range(B):
+            spike_times = torch.where(first_spikes[b] > 0)[0]
+            if len(spike_times) > 0:
+                first_spike_times[b] = spike_times[0]
+        
+        hard_latency = first_spike_times
         soft_latency = soft_lat(spikes)   # float, differentiable
         return spikes, hard_latency, soft_latency
 
@@ -121,7 +136,7 @@ class LatencyPredictor(nn.Module):
         sa, la_hard, la_soft = self.lifA(Ia)
         sb, lb_hard, lb_soft = self.lifB(Ib)
 
-        return (da, ida, vala, la_hard, la_soft), (db, idb, valb, lb_hard, lb_soft)
+        return (da, ida, vala, sa, la_hard, la_soft), (db, idb, valb, sb, lb_hard, lb_soft)
 
 
 # ============================================================
@@ -134,18 +149,57 @@ def latency_loss(la, lb):
 # ============================================================
 # 6) Visualization utilities
 # ============================================================
-def plot_winners(time, winner_idx):
-    time_np   = time.detach().cpu().numpy()
-    winner_np = winner_idx.detach().cpu().numpy()
-
-    plt.figure(figsize=(8,3))
-    plt.plot(time_np, winner_np, lw=1)
-    plt.title("Winning dendrite over time M")
-    plt.xlabel("Real time")
-    plt.ylabel("Dendrite index")
+def plot_spike_rasters_with_winners(time, spikes_a, winner_idx_a, spikes_b, winner_idx_b, threshold=0.5):
+    """
+    Plot spike rasters from both channels side-by-side with winning dendrite index overlaid.
+    Only shows winner index when an actual spike occurs (spike > threshold).
+    
+    spikes_a, spikes_b: [L] spike rasters from channels A and B
+    winner_idx_a, winner_idx_b: [L] winning dendrite index at each time
+    threshold: spike threshold for determining if a spike occurred
+    """
+    L = spikes_a.shape[0]
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+    
+    # Channel A (noisy)
+    ax = axes[0]
+    ax.plot(time, spikes_a, color='red', lw=2, alpha=0.7, label='Spikes')
+    ax.set_ylabel("Spike strength", color='red')
+    ax.tick_params(axis='y', labelcolor='red')
+    ax.set_title("Channel A (Noisy)")
+    ax.grid(True, alpha=0.3)
+    
+    # Overlay winner index only when spikes occur
+    ax2 = ax.twinx()
+    spike_mask_a = spikes_a > threshold
+    winner_on_spike_a = torch.where(spike_mask_a, winner_idx_a.float(), torch.nan)
+    ax2.scatter(time[spike_mask_a], winner_on_spike_a[spike_mask_a], 
+               color='blue', s=50, alpha=0.8, label='Winner')
+    ax2.set_ylabel("Winning dendrite", color='blue')
+    ax2.tick_params(axis='y', labelcolor='blue')
+    ax2.set_ylim(-0.5, winner_idx_a.max().item() + 1)
+    
+    # Channel B (clean)
+    ax = axes[1]
+    ax.plot(time, spikes_b, color='orange', lw=2, alpha=0.7, label='Spikes')
+    ax.set_ylabel("Spike strength", color='orange')
+    ax.tick_params(axis='y', labelcolor='orange')
+    ax.set_title("Channel B (Clean)")
+    ax.set_xlabel("Real time")
+    ax.grid(True, alpha=0.3)
+    
+    # Overlay winner index only when spikes occur
+    ax2 = ax.twinx()
+    spike_mask_b = spikes_b > threshold
+    winner_on_spike_b = torch.where(spike_mask_b, winner_idx_b.float(), torch.nan)
+    ax2.scatter(time[spike_mask_b], winner_on_spike_b[spike_mask_b], 
+               color='green', s=50, alpha=0.8, label='Winner')
+    ax2.set_ylabel("Winning dendrite", color='green')
+    ax2.tick_params(axis='y', labelcolor='green')
+    ax2.set_ylim(-0.5, winner_idx_b.max().item() + 1)
+    
     plt.tight_layout()
-    plt.show()
-
 
 def plot_dendrite_io(time, x, dendritic_outputs):
     """
@@ -154,68 +208,69 @@ def plot_dendrite_io(time, x, dendritic_outputs):
     Right column: dendritic filtered output
     """
     L, K2 = dendritic_outputs.shape
-
-    # ✅ ALLES matplotlib-sicher machen
-    time_np = time.detach().cpu().numpy()
-    x_np    = x.detach().cpu().numpy()
-    dend_np = dendritic_outputs.detach().cpu().numpy()
-
     fig, axes = plt.subplots(K2, 2, figsize=(10, 2*K2))
     for k in range(K2):
-        axes[k,0].plot(time_np, x_np, color='red')
+        axes[k,0].plot(time, x, color='red')
         axes[k,0].set_title(f"D{k} input")
 
-        axes[k,1].plot(time_np, dend_np[:,k], color='blue')
+        axes[k,1].plot(time, dendritic_outputs[:,k], color='blue')
         axes[k,1].set_title(f"D{k} output")
 
     plt.tight_layout()
-    plt.show()
-
 
 
 # ============================================================
-# 7) Training loop (expanded + commented)
+# 7) Generate synthetic self-supervised pair
 # ============================================================
-model = LatencyPredictor(T=20, K1=32, K2=12)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-loss_history = []
 t = torch.linspace(0, 4*3.14, 400).unsqueeze(0)
 clean = torch.sin(t)
 noisy = clean + 0.2*torch.randn_like(clean)
 
+# ============================================================
+# 8) Training loop (expanded + commented)
+# ============================================================
+model = LatencyPredictor(T=20, K1=32, K2=12)
+opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+losses = []
+
 for step in range(2000):
     # ---- forward pass ----
-    (da, ida, vala, la_hard, la_soft), (db, idb, valb, lb_hard, lb_soft) = model(noisy, clean)
+    (da, ida, vala, sa, la_hard, la_soft), (db, idb, valb, sb, lb_hard, lb_soft) = model(noisy, clean)
 
     # ---- compute latency-based self-supervised loss ----
     loss = latency_loss(la_soft, lb_soft)
-    loss_history.append(float(loss))
 
     # ---- optimize ----
     opt.zero_grad()
     loss.backward()
     opt.step()
 
+    losses.append(float(loss))
+
     if step % 200 == 0:
         print(step, float(loss))
 
 # ============================================================
-# 8) Visualization usage
+# 9) Visualization usage
 # ============================================================
-# Example after training:
-L_vis = vala.shape[1]    # segment length after Hankel
-time = t[0, -L_vis:]     # match Hankel-aligned end of time
-
-plot_winners(time, ida[0])
-plot_dendrite_io(time, noisy[0, -L_vis:], da[0])
-
-#===================loss history===========
-plt.figure(figsize=(6,4))
-plt.plot(loss_history, label="Training Loss")
-plt.xlabel("Step")
-plt.ylabel("Loss")
-plt.title("Latency-Matching Loss Over Time")
-plt.grid(True)
-plt.legend()
+# Training progress plot
+plt.figure(figsize=(10, 4))
+plt.plot(losses, lw=1)
+plt.xlabel("Training step")
+plt.ylabel("Loss (latency mismatch)")
+plt.title("Training Progress")
+plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
+
+# Example after training:
+T_window = 20  # matches T in LatencyPredictor
+L_vis = da.shape[1]  # segment length after Hankel
+time = t[0, T_window-1:T_window-1+L_vis]  # match Hankel-aligned time window
+
+# Plot spike rasters from both channels with winning dendrite overlaid
+plot_spike_rasters_with_winners(time.detach(), sa[0].detach(), ida[0].detach(),
+                                sb[0].detach(), idb[0].detach())
+plot_dendrite_io(time.detach(), noisy[0, T_window-1:T_window-1+L_vis].detach(), da[0].detach())
+

@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("Using device: MPS (Apple Silicon GPU)")
 # ============================================================
 # 1) Strict backward-looking Hankel (sliding window)
 # ============================================================
@@ -200,6 +202,7 @@ def plot_spike_rasters_with_winners(time, spikes_a, winner_idx_a, spikes_b, winn
     ax2.set_ylim(-0.5, winner_idx_b.max().item() + 1)
     
     plt.tight_layout()
+    plt.show()
 
 def plot_dendrite_io(time, x, dendritic_outputs):
     """
@@ -217,6 +220,7 @@ def plot_dendrite_io(time, x, dendritic_outputs):
         axes[k,1].set_title(f"D{k} output")
 
     plt.tight_layout()
+    plt.show()
 
 
 # ============================================================

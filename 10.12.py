@@ -9,6 +9,10 @@ import matplotlib.pyplot as plt
 # else:
 device = torch.device("cpu")
 
+# Toggle plotting (set False to run headless/non-interactive)
+DO_PLOT = False
+
+
 # ============================================================
 # 1) Strict backward-looking Hankel (sliding window)
 # ============================================================
@@ -21,8 +25,8 @@ def hankel_backward(x, T):
     """
     B, L = x.shape
     xs = []
-    for i in range(T, L+1):
-        xs.append(x[:, i-T:i])
+    for i in range(T, L + 1):
+        xs.append(x[:, i - T:i])
     return torch.stack(xs, dim=1)  # [B, L-T+1, T]
 
 
@@ -34,19 +38,19 @@ def hankel_backward(x, T):
 #     spikes: [B, L] with surrogate sigmoid spikes (0 to 1)
 #     time_indices: [B, L] with time values for each position
 #     Returns: [B, L] soft latency values (differentiable time-instants)
-    
+
 #     Uses spikes as soft weights to create a smooth version of torch.where,
 #     mapping each position to its estimated time index.
 #     """
 #     B, L = spikes.shape
-    
+
 #     # Normalize spikes to weights per position (soft version of "is there a spike here?")
 #     # Use sigmoid or normalize to [0, 1]
 #     soft_weights = torch.sigmoid(10 * (spikes - 0.5))  # Sharper soft weights
-    
+
 #     # For each spike position, the soft latency is the time index weighted by spike confidence
 #     soft_latencies = soft_weights * time_indices  # [B, L]
-    
+
 #     return soft_latencies
 
 
@@ -79,7 +83,7 @@ class LIF(nn.Module):
 
             # surrogate spike (soft) + hard spike with STE
             s_soft = torch.sigmoid(k * (v - self.th))  # surrogate
-            s_hard = (v >= self.th).float()            # hard spike (binary)
+            s_hard = (v >= self.th).float()  # hard spike (binary)
             s = s_hard.detach() - s_soft.detach() + s_soft  # STE
 
             # hard_spikes[:, t] = s_hard
@@ -91,13 +95,13 @@ class LIF(nn.Module):
         # Extract spike latencies as vectors from differentiable spikes
         time_indices = torch.arange(L, device=I.device, dtype=torch.float32)
         latencies = []
-        
+
         for b in range(B):
             # Find spike times using surrogate spikes (differentiable)
             # Threshold at 0.5 for spike detection
             spike_mask = spikes[b] > 0.5
             spike_times = torch.where(spike_mask)[0].float()  # indices where spike occurred
-            
+
             if len(spike_times) > 0:
                 # Extract latencies at spike positions: spike value * time index
                 spike_lats = spikes[b][spike_times.long()] * spike_times
@@ -107,7 +111,6 @@ class LIF(nn.Module):
                 latencies.append(torch.tensor([], device=I.device, dtype=torch.float32))
 
         return spikes, latencies
-
 
 
 # ============================================================
@@ -121,6 +124,7 @@ class DeepDendrites(nn.Module):
     - Lateral inhibition (subtract mean, clamp at 0, renormalise)
     - STE to keep a hard winner index for interpretability.
     """
+
     def __init__(self, T, K1=16, K2=8, temperature=0.1, inhibition_strength=1.0):
         super().__init__()
         self.W1 = nn.Linear(T, K1)
@@ -139,30 +143,30 @@ class DeepDendrites(nn.Module):
           soma_in : [B, L]     scalar current to soma
         """
         # Dendritic preprocessing
-        d1 = torch.relu(self.W1(H))   # [B, L, K1]
+        d1 = torch.relu(self.W1(H))  # [B, L, K1]
         d2 = torch.relu(self.W2(d1))  # [B, L, K2]
 
         # --- soft competition with lateral inhibition + renormalisation ---
         logits = d2 / self.temperature
-        soft_w = torch.softmax(logits, dim=-1)        # [B, L, K2], sum_k soft_w = 1
+        soft_w = torch.softmax(logits, dim=-1)  # [B, L, K2], sum_k soft_w = 1
 
-        mean_w = soft_w.mean(dim=-1, keepdim=True)    # [B, L, 1]
+        mean_w = soft_w.mean(dim=-1, keepdim=True)  # [B, L, 1]
         inhibited = soft_w - self.inhibition_strength * mean_w
-        inhibited = torch.relu(inhibited)             # losers go to 0
+        inhibited = torch.relu(inhibited)  # losers go to 0
 
         w_sur = inhibited / (inhibited.sum(dim=-1, keepdim=True) + 1e-6)  # renormalised
 
         # --- STE: hard winner for interpretability, soft for gradients ---
-        idx = d2.argmax(dim=-1)                              # [B, L]
-        hard_w = F.one_hot(idx, d2.shape[-1]).float()        # [B, L, K2]
+        idx = d2.argmax(dim=-1)  # [B, L]
+        hard_w = F.one_hot(idx, d2.shape[-1]).float()  # [B, L, K2]
 
-        w = hard_w.detach() - w_sur.detach() + w_sur         # STE weights
+        w = hard_w.detach() - w_sur.detach() + w_sur  # STE weights
 
         # Current into soma: weighted dendritic activations
-        soma_in = (w * d2).sum(dim=-1)                       # [B, L]
+        soma_in = (w * d2).sum(dim=-1)  # [B, L]
 
         # Winner value (for diagnostics)
-        vals = (hard_w * d2).sum(dim=-1)                     # [B, L]
+        vals = (hard_w * d2).sum(dim=-1)  # [B, L]
 
         return d2, idx, vals, w, soma_in
 
@@ -175,6 +179,7 @@ class LatencyPredictor(nn.Module):
     Two channels (A,B) supervise each other:
     Loss = |latA - latB|.
     """
+
     def __init__(self, T, K1=16, K2=8):
         super().__init__()
         self.encA = DeepDendrites(T, K1, K2)
@@ -187,55 +192,34 @@ class LatencyPredictor(nn.Module):
         Ha = hankel_backward(xa, self.T)  # [B, L', T]
         Hb = hankel_backward(xb, self.T)
 
-        da, ida, vala, wa, Ia = self.encA(Ha)   # d2, idx, vals, w, soma_in
+        da, ida, vala, wa, Ia = self.encA(Ha)  # d2, idx, vals, w, soma_in
         db, idb, valb, wb, Ib = self.encB(Hb)
 
-        sa, la = self.lifA(Ia)    # spikes [B,L], latencies (list of spike time vectors)
+        sa, la = self.lifA(Ia)  # spikes [B,L], latencies (list of spike time vectors)
         sb, lb = self.lifB(Ib)
 
         return (da, ida, vala, wa, sa, la), \
-               (db, idb, valb, wb, sb, lb)
+            (db, idb, valb, wb, sb, lb)
 
 
 # ============================================================
 # 5) Latency-matching loss
 # ============================================================
-def latency_loss(la, lb, num_bins: int = 5, count_penalty: float = 0.1):
-    """
-    Compact binned latency loss (no interpolation).
-    For each sample: split the shorter spike list into up to `num_bins` rank-based
-    bins, map each bin to a proportional index range in the longer list (no
-    interpolation), compute all pairwise squared differences inside the bin via
-    broadcasting, average per bin, then average bins. Add a count penalty for
-    differing spike counts.
-    """
-    B = max(len(la), len(lb))
-    device = next((x.device for x in la + lb if isinstance(x, torch.Tensor) and x.numel() > 0), torch.device('cpu'))
-    losses = []
-    for i in range(B):
-        a = la[i] if i < len(la) else torch.tensor([], device=device)
-        b = lb[i] if i < len(lb) else torch.tensor([], device=device)
-        a = a.float(); b = b.float(); na, nb = a.numel(), b.numel()
-        if na == 0 and nb == 0: continue
-        if na == 0 or nb == 0:
-            losses.append(count_penalty * float(abs(na - nb))); continue
-        s, l = (a, b) if na <= nb else (b, a)
-        ns, nl = s.numel(), l.numel()
-        bins = min(num_bins, max(1, ns))
-        edges = torch.linspace(0, float(ns), steps=bins + 1, device=device).long()
-        edges[-1] = ns
-        bin_losses = []
-        for k in range(bins):
-            st, ed = int(edges[k].item()), int(edges[k+1].item())
-            if ed <= st: continue
-            s_seg = s[st:ed]
-            lo = int((st * nl) // max(1, ns)); hi = int((ed * nl) // max(1, ns))
-            hi = min(max(hi, lo+1), nl)
-            l_seg = l[lo:hi]
-            if s_seg.numel() == 0 or l_seg.numel() == 0: continue
-            bin_losses.append(((s_seg.unsqueeze(1) - l_seg.unsqueeze(0)) ** 2).mean())
-        losses.append((torch.mean(torch.stack(bin_losses)) if bin_losses else torch.tensor(float(abs(na-nb)), device=device)) + count_penalty * float(abs(na-nb)))
-    return torch.mean(torch.stack(losses)) if losses else torch.tensor(0.0, device=device)
+def latency_loss(la, lb):
+    # Build per-sample absolute differences from in-order pairs, drop excess.
+    diffs = []
+    for a, b in zip(la, lb):
+        if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+            continue
+        n = int(min(a.numel(), b.numel()))
+        if n <= 0:
+            continue
+        diffs.append((a[:n].float().to(a.device) - b[:n].float().to(a.device)).abs())
+    if not diffs:
+        return torch.tensor(0.0, device=(
+            la[0].device if isinstance(la, list) and len(la) > 0 and isinstance(la[0], torch.Tensor) else torch.device(
+                'cpu')))
+    return torch.cat(diffs).mean()
 
 
 # ============================================================
@@ -270,11 +254,11 @@ def tau_weighted_dendritic_attribution(d2, w, hard_latencies, tau, window_factor
 
         t0 = max(0, t_spike - window)
         dt = torch.arange(t0, t_spike + 1, device=device)
-        decay = torch.exp(-(t_spike - dt) / tau)   # [T_win]
-        decay = decay.unsqueeze(-1)                # [T_win, 1]
+        decay = torch.exp(-(t_spike - dt) / tau)  # [T_win]
+        decay = decay.unsqueeze(-1)  # [T_win, 1]
 
-        I_win = I_d[b, t0:t_spike + 1, :]          # [T_win, K2]
-        contrib = (I_win * decay).sum(dim=0)       # [K2]
+        I_win = I_d[b, t0:t_spike + 1, :]  # [T_win, K2]
+        contrib = (I_win * decay).sum(dim=0)  # [K2]
 
         total = contrib.sum() + 1e-6
         attribution[b] = contrib / total
@@ -372,13 +356,23 @@ opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 losses = []
 
-for step in range(2000):
+for step in range(200):
     # ---- forward pass ----
     (da, ida, vala, wa, sa, la), \
-    (db, idb, valb, wb, sb, lb) = model(noisy, clean)
+        (db, idb, valb, wb, sb, lb) = model(noisy, clean)
 
     # ---- compute latency-based self-supervised loss ----
     loss = latency_loss(la, lb)
+    # If pairing-based loss is non-differentiable (no grad), fallback to
+    # a differentiable centroid/soft-spike loss computed from surrogate spikes.
+    if not (isinstance(loss, torch.Tensor) and loss.requires_grad):
+        eps = 1e-8
+        t_idx = torch.arange(sa.shape[1], device=device, dtype=sa.dtype).unsqueeze(0)
+        pa = sa / (sa.sum(dim=1, keepdim=True) + eps)
+        pb = sb / (sb.sum(dim=1, keepdim=True) + eps)
+        mu_a = (pa * t_idx).sum(dim=1)
+        mu_b = (pb * t_idx).sum(dim=1)
+        loss = (mu_a - mu_b).abs().mean()
 
     # ---- optimize ----
     opt.zero_grad()
@@ -394,29 +388,31 @@ for step in range(2000):
 # 10) Visualization + example attribution
 # ============================================================
 # Training progress plot
-plt.figure(figsize=(10, 4))
-plt.plot(losses, lw=1)
-plt.xlabel("Training step")
-plt.ylabel("Loss (latency mismatch)")
-plt.title("Training Progress")
-plt.grid(True, alpha=0.3)
-plt.tight_layout()
-plt.show()
+if DO_PLOT:
+    plt.figure(figsize=(10, 4))
+    plt.plot(losses, lw=1)
+    plt.xlabel("Training step")
+    plt.ylabel("Loss (latency mismatch)")
+    plt.title("Training Progress")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
 # Example after training:
 T_window = 20  # matches T in LatencyPredictor
 L_vis = da.shape[1]  # segment length after Hankel
 time = t[0, T_window - 1:T_window - 1 + L_vis].detach().cpu()  # match Hankel-aligned time window
 
-# Plot spike rasters from both channels with winning dendrite overlaid
-plot_spike_rasters_with_winners(time,
-                                sa[0].detach().cpu(), ida[0].detach().cpu(),
-                                sb[0].detach().cpu(), idb[0].detach().cpu())
+# Plot spike rasters from both channels with winning dendrite overlaid (optional)
+if DO_PLOT:
+    plot_spike_rasters_with_winners(time,
+                                    sa[0].detach().cpu(), ida[0].detach().cpu(),
+                                    sb[0].detach().cpu(), idb[0].detach().cpu())
 
-# Per-dendrite outputs for channel A (noisy)
-plot_dendrite_io(time,
-                 noisy[0, T_window - 1:T_window - 1 + L_vis].detach().cpu(),
-                 da[0].detach().cpu())
+    # Per-dendrite outputs for channel A (noisy)
+    plot_dendrite_io(time,
+                     noisy[0, T_window - 1:T_window - 1 + L_vis].detach().cpu(),
+                     da[0].detach().cpu())
 
 # --- τ-weighted dendritic attribution for FIRST spike in each channel ---
 # Extract first spike index from latency lists

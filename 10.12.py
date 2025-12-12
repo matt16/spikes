@@ -11,8 +11,10 @@ device = torch.device("cpu")
 
 # Toggle plotting (set False to run headless/non-interactive)
 DO_PLOT = False
-#TEST MY COMMIT
+# TEST MY COMMIT
 jkjj = 1
+
+
 # ============================================================
 # 1) Strict backward-looking Hankel (sliding window)
 # ============================================================
@@ -99,12 +101,11 @@ class LIF(nn.Module):
         for b in range(B):
             # Find spike times using surrogate spikes (differentiable)
             # Threshold at 0.5 for spike detection
-            spike_mask = spikes[b] > 0.5
-            spike_times = torch.where(spike_mask)[0].float()  # indices where spike occurred
-
+            # spike_mask = spikes[b] > 0.5
+            spike_times = torch.where(spikes[b, :])[0].float()  # indices where spike occurred
             if len(spike_times) > 0:
                 # Extract latencies at spike positions: spike value * time index
-                spike_lats = spikes[b][spike_times.long()] * spike_times
+                spike_lats = spikes[b, :] * torch.arange(0, L, device=I.device, dtype=spikes.dtype)
                 latencies.append(spike_lats)
             else:
                 # No spikes in this sample
@@ -205,16 +206,37 @@ class LatencyPredictor(nn.Module):
 # ============================================================
 # 5) Latency-matching loss
 # ============================================================
-def latency_loss(la, lb):
-    # Build per-sample absolute differences from in-order pairs, drop excess.
+def latency_loss(x_a, x_b, alpha=10.0, eps=1e-8):
+    def soft_spike_times(x, alpha=10.0, eps=1e-8):
+        # x: (K, T) -> returns (K,) weiche Spike-Zeiten
+        t = torch.arange(x.size(-1), device=x.device, dtype=x.dtype)
+        w = torch.sigmoid(alpha * x)  # (K, T)
+        w = w / (w.sum(dim=-1, keepdim=True) + eps)
+        return (w * t).sum(dim=-1)  # (K,)
+
+    t_a = soft_spike_times(x_a, alpha, eps)
+    t_b = soft_spike_times(x_b, alpha, eps)
+
+    K = min(t_a.size(0), t_b.size(0))
+    if K == 0:
+        return (t_a.sum() * 0 + t_b.sum() * 0)
+
+    t_a, _ = t_a.sort()
+    t_b, _ = t_b.sort()
+    d = t_a[:K] - t_b[:K]
+    return (d * d).mean()
+
+    # Compute differences between non-zero entries in order, drop any excess.
     diffs = []
     for a, b in zip(la, lb):
         if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
             continue
-        n = int(min(a.numel(), b.numel()))
+        a_nonzero = a[a != 0].float()
+        b_nonzero = b[b != 0].float()
+        n = int(min(a_nonzero.numel(), b_nonzero.numel()))
         if n <= 0:
             continue
-        diffs.append((a[:n].float().to(a.device) - b[:n].float().to(a.device)).abs())
+        diffs.append((a_nonzero[:n] - b_nonzero[:n]).abs())
     if not diffs:
         return torch.tensor(0.0, device=(
             la[0].device if isinstance(la, list) and len(la) > 0 and isinstance(la[0], torch.Tensor) else torch.device(

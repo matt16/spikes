@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-#if torch.backends.mps.is_available():
+# if torch.backends.mps.is_available():
 #     device = torch.device("mps")
 #     print("Using device: MPS (Apple Silicon GPU)")
 device = torch.device("cpu")
@@ -27,13 +27,23 @@ def hankel_backward(x, T):
 
 
 # ============================================================
-# 2) Surrogate LIF ODE + cumulative spike series
+# 2) Surrogate LIF with refractory + adaptation + hyperpolarization
 # ============================================================
 class LIF(nn.Module):
-    def __init__(self, tau=20.0, threshold=1.0):
+    def __init__(
+        self,
+        tau=20.0,
+        threshold=1.0,
+        tau_adapt=100.0,     # slow adaptation time constant
+        beta_adapt=1.5,      # threshold increase strength
+        v_reset=-0.5         # hyperpolarizing reset value
+    ):
         super().__init__()
         self.tau = tau
         self.th = threshold
+        self.tau_adapt = tau_adapt
+        self.beta_adapt = beta_adapt
+        self.v_reset = v_reset
 
     def forward(self, I):
         """
@@ -44,45 +54,57 @@ class LIF(nn.Module):
           hard_first   : [B]    first hard spike index (L if none) for attribution/debug
         """
         B, L = I.shape
+        device = I.device
+        dtype = I.dtype
 
-        # keep v as [B, 1] for clean broadcasting
-        v = torch.zeros(B, 1, device=I.device, dtype=I.dtype)
+        v = torch.zeros(B, 1, device=device, dtype=dtype)
+        a = torch.zeros(B, 1, device=device, dtype=dtype)   # adaptation variable
 
-        spikes = torch.zeros(B, L, device=I.device, dtype=I.dtype)
-        spike_series = torch.zeros(B, L, device=I.device, dtype=I.dtype)
+        spikes = torch.zeros(B, L, device=device, dtype=dtype)
+        spike_series = torch.zeros(B, L, device=device, dtype=dtype)
 
-        # s_num: [B, 1] cumulative sum of s
-        s_num = torch.zeros(B, 1, device=I.device, dtype=I.dtype)
+        s_num = torch.zeros(B, 1, device=device, dtype=dtype)
 
-        # for attribution/debug: first hard spike time
-        hard_first = torch.full((B,), L, device=I.device, dtype=torch.long)
-        has_spiked = torch.zeros(B, device=I.device, dtype=torch.bool)
+        hard_first = torch.full((B,), L, device=device, dtype=torch.long)
+        has_spiked = torch.zeros(B, device=device, dtype=torch.bool)
 
-        k = 10.0
+        k = 10.0  # surrogate slope
 
         for t in range(L):
-            dv = -v / self.tau + I[:, t].unsqueeze(1)  # [B, 1]
+            # effective threshold with adaptation
+            th_eff = self.th + self.beta_adapt * a
+
+            dv = (-v / self.tau + I[:, t].unsqueeze(1))
             v = v + dv
 
-            s_soft = torch.sigmoid(k * (v - self.th))      # [B, 1]
-            s_hard = (v >= self.th).to(I.dtype)            # [B, 1]
-            s = s_hard.detach() - s_soft.detach() + s_soft # STE, [B, 1]
+            # surrogate spike
+            s_soft = torch.sigmoid(k * (v - th_eff))
+            s_hard = (v >= th_eff).to(dtype)
 
-            # spike raster (as before)
+            s = s_hard.detach() - s_soft.detach() + s_soft  # STE
+
+
+
             spikes[:, t] = s.squeeze(1)
 
-            # accumulate s_num and write cumulative series
+            # cumulative spike series
             s_num = s_num + s
             spike_series[:, t] = s_num.squeeze(1)
 
-            # record first hard spike time (not used in loss; fine to keep it hard)
+            # first hard spike time (debug/attr)
             newly = (~has_spiked) & (s_hard.squeeze(1) > 0)
             if newly.any():
                 hard_first[newly] = t
                 has_spiked[newly] = True
 
-            # reset potential after spike (stop-grad on spike)
-            v = v * (1 - s.detach())
+            # reset with hyperpolarization (stop-grad on spike)
+            v = v * (1 - s.detach()) + self.v_reset * s.detach()
+
+            # adaptation dynamics
+            da = -a / self.tau_adapt + s
+            a = a + da
+
+
 
         return spikes, spike_series, hard_first
 
@@ -123,15 +145,20 @@ class DeepDendrites(nn.Module):
 
 
 # ============================================================
-# 4) Full self-supervised latency predictor (now series-based)
+# 4) Full self-supervised latency predictor (series-based)
 # ============================================================
 class LatencyPredictor(nn.Module):
     def __init__(self, T, K1=16, K2=8):
         super().__init__()
         self.encA = DeepDendrites(T, K1, K2)
         self.encB = DeepDendrites(T, K1, K2)
-        self.lifA = LIF()
-        self.lifB = LIF()
+
+        # Use the improved LIF for both channels
+        self.lifA = LIF(tau=20.0, threshold=1.0, tau_adapt=100.0, beta_adapt=1.5,
+                         v_reset=-0.5)
+        self.lifB = LIF(tau=20.0, threshold=1.0, tau_adapt=100.0, beta_adapt=1.5,
+                         v_reset=-0.5)
+
         self.T = T
 
     def forward(self, xa, xb):
@@ -152,7 +179,6 @@ class LatencyPredictor(nn.Module):
 # 5) Series-L1 loss (fully differentiable)
 # ============================================================
 def series_l1_loss(series_a, series_b):
-    # series_*: [B, L]
     return torch.abs(series_a - series_b).mean()
 
 
@@ -252,6 +278,7 @@ t = torch.linspace(0, 4 * 3.14, 400, device=device).unsqueeze(0)
 clean = torch.sin(t)
 noisy = clean + 0.2 * torch.randn_like(clean)
 
+
 # ============================================================
 # 9) Training loop
 # ============================================================
@@ -260,12 +287,14 @@ opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 losses = []
 
-for step in range(2000):
+lambda_spike = 1e-3  # spike-cost strength (try 1e-4 .. 1e-2 if needed)
+
+for step in range(1000):
     (da, ida, vala, wa, sa, series_a, first_a), \
     (db, idb, valb, wb, sb, series_b, first_b) = model(noisy, clean)
 
-    # differentiable series L1 loss
-    loss = series_l1_loss(series_a, series_b)
+    # differentiable series L1 loss + spike-rate regularizer
+    loss = series_l1_loss(series_a, series_b) + lambda_spike * (sa.mean() + sb.mean())
 
     opt.zero_grad()
     loss.backward()
@@ -273,8 +302,9 @@ for step in range(2000):
 
     losses.append(float(loss))
 
-    if step % 200 == 0:
+    if step % 20 == 0:
         print(step, float(loss))
+
 
 # ============================================================
 # 10) Visualization + example attribution
@@ -284,7 +314,7 @@ if DO_PLOT:
     plt.figure(figsize=(10, 4))
     plt.plot(losses, lw=1)
     plt.xlabel("Training step")
-    plt.ylabel("Loss (series L1 mismatch)")
+    plt.ylabel("Loss (series L1 + spike cost)")
     plt.title("Training Progress")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()

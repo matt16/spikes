@@ -3,7 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-#if torch.backends.mps.is_available():
+# NEW: for colored line segments
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
+
+# if torch.backends.mps.is_available():
 #     device = torch.device("mps")
 #     print("Using device: MPS (Apple Silicon GPU)")
 device = torch.device("cpu")
@@ -27,13 +31,23 @@ def hankel_backward(x, T):
 
 
 # ============================================================
-# 2) Surrogate LIF ODE + cumulative spike series
+# 2) Surrogate LIF (NO refractory) with adaptation + hyperpolarization reset
 # ============================================================
 class LIF(nn.Module):
-    def __init__(self, tau=20.0, threshold=1.0):
+    def __init__(
+        self,
+        tau=20.0,
+        threshold=1.0,
+        tau_adapt=100.0,     # slow adaptation time constant
+        beta_adapt=1.5,      # threshold increase strength
+        v_reset=-0.5         # hyperpolarizing reset value
+    ):
         super().__init__()
         self.tau = tau
         self.th = threshold
+        self.tau_adapt = tau_adapt
+        self.beta_adapt = beta_adapt
+        self.v_reset = v_reset
 
     def forward(self, I):
         """
@@ -44,45 +58,54 @@ class LIF(nn.Module):
           hard_first   : [B]    first hard spike index (L if none) for attribution/debug
         """
         B, L = I.shape
+        device = I.device
+        dtype = I.dtype
 
-        # keep v as [B, 1] for clean broadcasting
-        v = torch.zeros(B, 1, device=I.device, dtype=I.dtype)
+        v = torch.zeros(B, 1, device=device, dtype=dtype)
+        a = torch.zeros(B, 1, device=device, dtype=dtype)   # adaptation variable
 
-        spikes = torch.zeros(B, L, device=I.device, dtype=I.dtype)
-        spike_series = torch.zeros(B, L, device=I.device, dtype=I.dtype)
+        spikes = torch.zeros(B, L, device=device, dtype=dtype)
+        spike_series = torch.zeros(B, L, device=device, dtype=dtype)
 
-        # s_num: [B, 1] cumulative sum of s
-        s_num = torch.zeros(B, 1, device=I.device, dtype=I.dtype)
+        s_num = torch.zeros(B, 1, device=device, dtype=dtype)
 
-        # for attribution/debug: first hard spike time
-        hard_first = torch.full((B,), L, device=I.device, dtype=torch.long)
-        has_spiked = torch.zeros(B, device=I.device, dtype=torch.bool)
+        hard_first = torch.full((B,), L, device=device, dtype=torch.long)
+        has_spiked = torch.zeros(B, device=device, dtype=torch.bool)
 
-        k = 10.0
+        k = 10.0  # surrogate slope
 
         for t in range(L):
-            dv = -v / self.tau + I[:, t].unsqueeze(1)  # [B, 1]
+            # effective threshold with adaptation
+            th_eff = self.th + self.beta_adapt * a
+
+            # integrate (NO refractory masking)
+            dv = (-v / self.tau + I[:, t].unsqueeze(1))
             v = v + dv
 
-            s_soft = torch.sigmoid(k * (v - self.th))      # [B, 1]
-            s_hard = (v >= self.th).to(I.dtype)            # [B, 1]
-            s = s_hard.detach() - s_soft.detach() + s_soft # STE, [B, 1]
+            # surrogate spike
+            s_soft = torch.sigmoid(k * (v - th_eff))
+            s_hard = (v >= th_eff).to(dtype)
 
-            # spike raster (as before)
+            s = s_hard.detach() - s_soft.detach() + s_soft  # STE
+
             spikes[:, t] = s.squeeze(1)
 
-            # accumulate s_num and write cumulative series
+            # cumulative spike series
             s_num = s_num + s
             spike_series[:, t] = s_num.squeeze(1)
 
-            # record first hard spike time (not used in loss; fine to keep it hard)
+            # first hard spike time (debug/attr)
             newly = (~has_spiked) & (s_hard.squeeze(1) > 0)
             if newly.any():
                 hard_first[newly] = t
                 has_spiked[newly] = True
 
-            # reset potential after spike (stop-grad on spike)
-            v = v * (1 - s.detach())
+            # reset with hyperpolarization (stop-grad on spike)
+            v = v * (1 - s.detach()) + self.v_reset * s.detach()
+
+            # adaptation dynamics
+            da = -a / self.tau_adapt + s
+            a = a + da
 
         return spikes, spike_series, hard_first
 
@@ -123,15 +146,20 @@ class DeepDendrites(nn.Module):
 
 
 # ============================================================
-# 4) Full self-supervised latency predictor (now series-based)
+# 4) Full self-supervised latency predictor (series-based)
 # ============================================================
 class LatencyPredictor(nn.Module):
     def __init__(self, T, K1=16, K2=8):
         super().__init__()
         self.encA = DeepDendrites(T, K1, K2)
         self.encB = DeepDendrites(T, K1, K2)
-        self.lifA = LIF()
-        self.lifB = LIF()
+
+        # LIF WITHOUT refractory
+        self.lifA = LIF(tau=20.0, threshold=1.5, tau_adapt=100.0, beta_adapt=1.5,
+                        v_reset=-0.5)
+        self.lifB = LIF(tau=20.0, threshold=1.5, tau_adapt=100.0, beta_adapt=1.5,
+                        v_reset=-0.5)
+
         self.T = T
 
     def forward(self, xa, xb):
@@ -152,7 +180,6 @@ class LatencyPredictor(nn.Module):
 # 5) Series-L1 loss (fully differentiable)
 # ============================================================
 def series_l1_loss(series_a, series_b):
-    # series_*: [B, L]
     return torch.abs(series_a - series_b).mean()
 
 
@@ -187,7 +214,7 @@ def tau_weighted_dendritic_attribution(d2, w, hard_latencies, tau, window_factor
 
 
 # ============================================================
-# 7) Visualization utilities (unchanged)
+# 7) Visualization utilities
 # ============================================================
 def plot_spike_rasters_with_winners(time, spikes_a, winner_idx_a,
                                     spikes_b, winner_idx_b, threshold=0.5):
@@ -246,11 +273,166 @@ def plot_dendrite_io(time, x, dendritic_outputs):
 
 
 # ============================================================
+# 7b) Spike-Centric "Causal Stack" plot
+#     UPDATED: no heatmap panel, credit is encoded ON the curves
+# ============================================================
+def _rising_edges(spikes_1d, thr=0.5, refractory=3):
+    """
+    spikes_1d: [L] soft spikes
+    Returns indices of rising edges (events). Optional simple index-space refractory.
+    """
+    s = spikes_1d.detach().cpu()
+    above = (s > thr).to(torch.int32)
+    rise = torch.where((above[1:] == 1) & (above[:-1] == 0))[0] + 1
+    if rise.numel() == 0:
+        return rise
+
+    keep = [int(rise[0].item())]
+    last = keep[0]
+    for idx in rise[1:]:
+        ti = int(idx.item())
+        if ti - last >= refractory:
+            keep.append(ti)
+            last = ti
+    return torch.tensor(keep, dtype=torch.long)
+
+
+def _colored_line(ax, x, y, c, lw=2.0, alpha=1.0):
+    """
+    Plot a line y(x) with color mapped from c at each x (segment-wise).
+    x, y, c: 1D tensors/arrays, same length
+    """
+    if isinstance(x, torch.Tensor): x = x.detach().cpu().numpy()
+    if isinstance(y, torch.Tensor): y = y.detach().cpu().numpy()
+    if isinstance(c, torch.Tensor): c = c.detach().cpu().numpy()
+
+    # line segments between consecutive points
+    pts = torch.tensor(list(zip(x, y))).numpy()
+    segs = torch.stack([torch.tensor(pts[:-1]), torch.tensor(pts[1:])], dim=1).numpy()
+
+    lc = LineCollection(segs, array=c[:-1], linewidths=lw, alpha=alpha)
+    ax.add_collection(lc)
+    ax.autoscale_view()
+    return lc
+
+
+def plot_causal_stack_per_spike(
+    time, x, d2, w, spikes, winner_idx=None,
+    tau=20.0, spike_thr=0.5, window_factor=3.0, max_spikes=6,
+    event_refractory=3,
+    show_colorbar=True
+):
+    """
+    For each spike event (rising edge), plot:
+      A) x(t) around spike
+      B) dendrite contributions I_k(t)=w*d2  (ONLY winner + runner-up),
+         colored along the curve by causal credit C_k(t)=I_k(t)*exp(-(t_s-t)/tau)
+    """
+    time_t = time.detach().cpu() if isinstance(time, torch.Tensor) else torch.tensor(time)
+    x_t    = x.detach().cpu()    if isinstance(x, torch.Tensor) else torch.tensor(x)
+    d2_t   = d2.detach().cpu()
+    w_t    = w.detach().cpu()
+    sp_t   = spikes.detach().cpu()
+    win_t  = winner_idx.detach().cpu() if winner_idx is not None else None
+
+    L, K2 = d2_t.shape
+    tau_f = float(tau)
+    win_len = int(window_factor * tau_f)
+
+    I_d = w_t * d2_t  # [L, K2]
+
+    events = _rising_edges(sp_t, thr=spike_thr, refractory=event_refractory)
+    if events.numel() == 0:
+        print("No spike events (rising edges) found above threshold.")
+        return
+    events = events[:max_spikes]
+    n = int(events.numel())
+
+    # normalize colors across all selected spikes for comparability
+    all_credits = []
+    for t_s in events.tolist():
+        t0 = max(0, t_s - win_len)
+        idx = torch.arange(t0, t_s + 1)
+        decay = torch.exp(-(t_s - idx).float() / tau_f)  # [win]
+        C_all = I_d[idx, :] * decay.unsqueeze(1)         # [win, K2]
+        all_credits.append(C_all)
+    C_cat = torch.cat(all_credits, dim=0)
+    vmin = float(torch.min(C_cat).item())
+    vmax = float(torch.max(C_cat).item()) + 1e-12
+    norm = Normalize(vmin=vmin, vmax=vmax)
+
+    fig = plt.figure(figsize=(13, 2.6 * n), constrained_layout=True)
+    gs = fig.add_gridspec(nrows=2 * n, ncols=1)
+
+    first_lc = None
+
+    for i, t_s in enumerate(events.tolist()):
+        t0 = max(0, t_s - win_len)
+        idx = torch.arange(t0, t_s + 1)
+
+        decay = torch.exp(-(t_s - idx).float() / tau_f)  # [win]
+        C = I_d[idx, :] * decay.unsqueeze(1)             # [win, K2]
+
+        # winner at spike time
+        k_star = int(win_t[t_s].item()) if win_t is not None else None
+
+        # runner-up by total causal credit in the same window (exclude winner)
+        totals = C.sum(dim=0)  # [K2]
+        if k_star is not None and 0 <= k_star < K2:
+            totals_ru = totals.clone()
+            totals_ru[k_star] = -1e9
+            k_ru = int(torch.argmax(totals_ru).item())
+        else:
+            k_ru = int(torch.argmax(totals).item())
+            k_star = k_ru  # fallback
+
+        # --- Track A: Input ---
+        axA = fig.add_subplot(gs[2*i + 0, 0])
+        axA.plot(time_t[idx], x_t[idx], lw=1.2)
+        axA.axvline(time_t[t_s].item(), lw=1.0)
+        axA.set_ylabel("x(t)")
+        axA.grid(True, alpha=0.25)
+        axA.set_title(
+            f"Spike {i+1} | t_idx={t_s} | winner D{k_star} | runner-up D{k_ru} | lookback≈{win_len}≈{window_factor}τ | τ={tau_f:g}"
+        )
+
+        # --- Track B: Winner + runner-up (colored by credit) ---
+        axB = fig.add_subplot(gs[2*i + 1, 0], sharex=axA)
+
+        lc1 = _colored_line(axB, time_t[idx], I_d[idx, k_star], C[:, k_star], lw=2.6, alpha=0.95)
+        lc1.set_norm(norm)
+
+        lc2 = _colored_line(axB, time_t[idx], I_d[idx, k_ru],   C[:, k_ru],   lw=1.6, alpha=0.85)
+        lc2.set_norm(norm)
+
+        axB.axvline(time_t[t_s].item(), lw=1.0)
+        axB.set_ylabel("I_k(t)")
+        axB.grid(True, alpha=0.25)
+
+        # lightweight legend (line samples)
+        axB.plot([], [], lw=2.6, label=f"winner D{k_star} (colored)")
+        axB.plot([], [], lw=1.6, label=f"runner-up D{k_ru} (colored)")
+        axB.legend(loc="upper right", frameon=False)
+
+        if first_lc is None:
+            first_lc = lc1
+
+        if i == n - 1:
+            axB.set_xlabel("time")
+
+    if show_colorbar and first_lc is not None:
+        fig.colorbar(first_lc, ax=fig.axes, fraction=0.02, pad=0.01, label="causal credit")
+
+    plt.show()
+
+
+# ============================================================
 # 8) Generate synthetic self-supervised pair
 # ============================================================
 t = torch.linspace(0, 4 * 3.14, 400, device=device).unsqueeze(0)
 clean = torch.sin(t)
 noisy = clean + 0.2 * torch.randn_like(clean)
+
 
 # ============================================================
 # 9) Training loop
@@ -260,12 +442,14 @@ opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 losses = []
 
-for step in range(2000):
+lambda_spike = 1e-3  # spike-cost strength (try 1e-4 .. 1e-2 if needed)
+
+for step in range(1000):
     (da, ida, vala, wa, sa, series_a, first_a), \
     (db, idb, valb, wb, sb, series_b, first_b) = model(noisy, clean)
 
-    # differentiable series L1 loss
-    loss = series_l1_loss(series_a, series_b)
+    # differentiable series L1 loss + spike-rate regularizer
+    loss = series_l1_loss(series_a, series_b) + lambda_spike * (sa.mean() + sb.mean())
 
     opt.zero_grad()
     loss.backward()
@@ -273,8 +457,9 @@ for step in range(2000):
 
     losses.append(float(loss))
 
-    if step % 200 == 0:
+    if step % 20 == 0:
         print(step, float(loss))
+
 
 # ============================================================
 # 10) Visualization + example attribution
@@ -284,7 +469,7 @@ if DO_PLOT:
     plt.figure(figsize=(10, 4))
     plt.plot(losses, lw=1)
     plt.xlabel("Training step")
-    plt.ylabel("Loss (series L1 mismatch)")
+    plt.ylabel("Loss (series L1 + spike cost)")
     plt.title("Training Progress")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -302,6 +487,22 @@ if DO_PLOT:
     plot_dendrite_io(time,
                      noisy[0, T_window - 1:T_window - 1 + L_vis].detach().cpu(),
                      da[0].detach().cpu())
+
+    # UPDATED: Spike-centric causal stack (Channel A) with credit ON the curves
+    plot_causal_stack_per_spike(
+        time=time,
+        x=noisy[0, T_window - 1:T_window - 1 + L_vis].detach().cpu(),
+        d2=da[0].detach().cpu(),
+        w=wa[0].detach().cpu(),
+        spikes=sa[0].detach().cpu(),
+        winner_idx=ida[0].detach().cpu(),
+        tau=float(model.lifA.tau),
+        spike_thr=0.5,
+        window_factor=3.0,
+        max_spikes=6,
+        event_refractory=3,
+        show_colorbar=True
+    )
 
 # Attribution uses hard first-spike indices returned by LIF
 attrA = tau_weighted_dendritic_attribution(da, wa, first_a, model.lifA.tau)

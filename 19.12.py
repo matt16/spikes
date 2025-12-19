@@ -8,21 +8,64 @@ from matplotlib.colors import Normalize
 device = torch.device("cpu")
 DO_PLOT = True
 
+
 # ============================================================
-# 1) Strict backward-looking Hankel (sliding window)
+# 1) Causal Conv Filter Bank (replaces Hankel+MLP)
 # ============================================================
-def hankel_backward(x, T):
+class ConvFilterBank(nn.Module):
     """
-    x: [B, L]
-    Return windows ending at each time step:
-    H[b, t] = x[b, t-T : t]
-    Shape: [B, L-T+1, T]
+    Runs a bank of causal 1D conv filters with stride=1.
+    Each filter output at time t depends on x[t-(k-1) ... t] (last value is always x[t]).
+    Variable kernel sizes are supported by grouping filters per kernel size.
+
+    Output:
+      d2: [B, L_eff, K]  (ReLU activations, cropped to valid region based on max kernel)
+      warmup: int = (max_kernel_size - 1)
     """
-    B, L = x.shape
-    xs = []
-    for i in range(T, L + 1):
-        xs.append(x[:, i - T:i])
-    return torch.stack(xs, dim=1)  # [B, L-T+1, T]
+    def __init__(self, kernel_sizes, bias=True):
+        super().__init__()
+        self.kernel_sizes = list(kernel_sizes)
+        self.kmax = max(self.kernel_sizes)
+
+        # group by kernel size
+        size_to_count = {}
+        for k in self.kernel_sizes:
+            size_to_count[k] = size_to_count.get(k, 0) + 1
+
+        # deterministic order for concat
+        self._unique_sizes = sorted(size_to_count.keys())
+        self._counts = [size_to_count[k] for k in self._unique_sizes]
+
+        self.branches = nn.ModuleList([
+            nn.Conv1d(in_channels=1, out_channels=size_to_count[k], kernel_size=k, stride=1, bias=bias)
+            for k in self._unique_sizes
+        ])
+
+        self.K = sum(self._counts)
+
+    def forward(self, x):
+        # x: [B, L]
+        B, L = x.shape
+        x1 = x.unsqueeze(1)  # [B, 1, L]
+
+        outs = []
+        for conv, k in zip(self.branches, self._unique_sizes):
+            # causal left padding: pad (k-1) zeros on the left
+            xpad = F.pad(x1, (k - 1, 0))
+            y = conv(xpad)         # [B, Ck, L]
+            y = F.relu(y)          # dendritic values
+            outs.append(y)
+
+        # [B, K, L] -> [B, L, K]
+        y_all = torch.cat(outs, dim=1)
+        d2 = y_all.transpose(1, 2)
+
+        # crop warmup so all filters are comparable (full context for max kernel)
+        warmup = self.kmax - 1
+        if warmup > 0:
+            d2 = d2[:, warmup:, :]  # [B, L - warmup, K]
+
+        return d2, warmup
 
 
 # ============================================================
@@ -34,6 +77,7 @@ class LIF(nn.Module):
         self.tau, self.th, self.tau_adapt, self.beta_adapt, self.v_reset = tau, threshold, tau_adapt, beta_adapt, v_reset
 
     def forward(self, I):
+        # I: [B, L]
         B, L = I.shape
         device = I.device
         dtype = I.dtype
@@ -47,29 +91,22 @@ class LIF(nn.Module):
         k = 10.0  # surrogate slope
 
         for t in range(L):
-            # effective threshold with adaptation
             th_eff = self.th + self.beta_adapt * a
 
-            # integrate (NO refractory masking)
             dv = (-v / self.tau + I[:, t].unsqueeze(1))
             v = v + dv
 
-            # surrogate spike
             s_soft = torch.sigmoid(k * (v - th_eff))
             s_hard = (v >= th_eff).to(dtype)
-
             s = s_hard.detach() - s_soft.detach() + s_soft  # STE
 
             spikes[:, t] = s.squeeze(1)
 
-            # cumulative spike series
             s_num = s_num + s
             spike_series[:, t] = s_num.squeeze(1)
 
-            # reset with hyperpolarization (stop-grad on spike)
             v = v * (1 - s.detach()) + self.v_reset * s.detach()
 
-            # adaptation dynamics
             da = -a / self.tau_adapt + s
             a = a + da
 
@@ -77,25 +114,31 @@ class LIF(nn.Module):
 
 
 # ============================================================
-# 3) Deep dendrites with suppressive winner-dominant competition
+# 3) Winner-dominant competition (mechanics unchanged)
 # ============================================================
-class DeepDendrites(nn.Module):
-    def __init__(self, T, K1=16, K2=8, temperature=0.1, inhibition_strength=1.0):
+class WinnerCombiner(nn.Module):
+    """
+    Takes dendritic activations d2[t,k] and selects a winner per time step.
+    Keeps the previous mechanics:
+      - soft weights via softmax(logits/temperature)
+      - subtract mean for inhibition, relu, renorm
+      - hard winner via argmax
+      - STE merge: w = hard - soft.detach + soft
+      - soma input: I[t] = sum_k w[t,k]*d2[t,k]
+    """
+    def __init__(self, temperature=0.1, inhibition_strength=1.0):
         super().__init__()
-        self.W1, self.W2 = nn.Linear(T, K1), nn.Linear(K1, K2)
-        self.temperature, self.inhibition_strength = temperature, inhibition_strength
+        self.temperature = temperature
+        self.inhibition_strength = inhibition_strength
 
-    def forward(self, H):
-        d1 = torch.relu(self.W1(H))   # [B, L, K1]
-        d2 = torch.relu(self.W2(d1))  # [B, L, K2]
-
+    def forward(self, d2):
+        # d2: [B, L, K]
         logits = d2 / self.temperature
-        soft_w = torch.softmax(logits, dim=-1)  # [B, L, K2]
+        soft_w = torch.softmax(logits, dim=-1)  # [B, L, K]
 
         mean_w = soft_w.mean(dim=-1, keepdim=True)
         inhibited = soft_w - self.inhibition_strength * mean_w
         inhibited = torch.relu(inhibited)
-
         w_sur = inhibited / (inhibited.sum(dim=-1, keepdim=True) + 1e-6)
 
         idx = d2.argmax(dim=-1)  # [B, L]
@@ -103,45 +146,44 @@ class DeepDendrites(nn.Module):
 
         w = hard_w.detach() - w_sur.detach() + w_sur  # STE weights
 
-        soma_in = (w * d2).sum(dim=-1)  # [B, L]
-        vals = (hard_w * d2).sum(dim=-1)
+        soma_in = (w * d2).sum(dim=-1)      # [B, L]
+        vals = (hard_w * d2).sum(dim=-1)   # [B, L] winner values
 
-        return d2, idx, vals, w, soma_in
+        return idx, vals, w, soma_in
 
 
 # ============================================================
-# 4) Full self-supervised latency predictor (series-based)
+# 4) Full model: ConvFilterBank -> WinnerCombiner -> LIF
 # ============================================================
 class LatencyPredictor(nn.Module):
-    def __init__(self, T, K1=16, K2=8):
+    def __init__(self, kernel_sizes, temperature=0.1, inhibition_strength=1.0):
         super().__init__()
-        self.encA = DeepDendrites(T, K1, K2)
-        self.encB = DeepDendrites(T, K1, K2)
+        self.fbA = ConvFilterBank(kernel_sizes=kernel_sizes)
+        self.fbB = ConvFilterBank(kernel_sizes=kernel_sizes)
 
+        self.encA = WinnerCombiner(temperature=temperature, inhibition_strength=inhibition_strength)
+        self.encB = WinnerCombiner(temperature=temperature, inhibition_strength=inhibition_strength)
 
+        # LIF WITHOUT refractory (kept as-is)
+        self.lifA = LIF(tau=20.0, threshold=1.5, tau_adapt=100.0, beta_adapt=1.5, v_reset=-0.5)
+        self.lifB = LIF(tau=20.0, threshold=1.5, tau_adapt=100.0, beta_adapt=1.5, v_reset=-0.5)
 
-
-
-        # LIF WITHOUT refractory
-        self.lifA = LIF(tau=20.0, threshold=1.5, tau_adapt=100.0, beta_adapt=1.5,
-                        v_reset=-0.5)
-        self.lifB = LIF(tau=20.0, threshold=1.5, tau_adapt=100.0, beta_adapt=1.5,
-                        v_reset=-0.5)
-
-        self.T = T
+        self.kmax = max(kernel_sizes)
 
     def forward(self, xa, xb):
-        Ha = hankel_backward(xa, self.T)
-        Hb = hankel_backward(xb, self.T)
+        # xa, xb: [B, L]
+        d2a, warmup_a = self.fbA(xa)
+        d2b, warmup_b = self.fbB(xb)
+        warmup = max(warmup_a, warmup_b)
 
-        da, ida, vala, wa, Ia = self.encA(Ha)
-        db, idb, valb, wb, Ib = self.encB(Hb)
+        ida, vala, wa, Ia = self.encA(d2a)
+        idb, valb, wb, Ib = self.encB(d2b)
 
         sa, series_a = self.lifA(Ia)
         sb, series_b = self.lifB(Ib)
 
-        return (da, ida, vala, wa, sa, series_a), \
-               (db, idb, valb, wb, sb, series_b)
+        return (d2a, ida, vala, wa, sa, series_a, warmup), \
+               (d2b, idb, valb, wb, sb, series_b, warmup)
 
 
 # ============================================================
@@ -149,7 +191,6 @@ class LatencyPredictor(nn.Module):
 # ============================================================
 def series_l1_loss(series_a, series_b):
     return torch.abs(series_a - series_b).mean()
-
 
 
 # ============================================================
@@ -163,18 +204,18 @@ noisy = clean + 0.2 * torch.randn_like(clean)
 # ============================================================
 # 8) Training loop
 # ============================================================
-model = LatencyPredictor(T=20, K1=32, K2=6).to(device)
+kernel_sizes = [4, 6, 8, 10, 12, 20]  # variable filter lengths allowed (K = len(list))
+
+model = LatencyPredictor(kernel_sizes=kernel_sizes, temperature=0.1, inhibition_strength=1.0).to(device)
 opt = torch.optim.Adam(model.parameters(), lr=1e-3)
 
 losses = []
-
-lambda_spike = 1e-3  # spike-cost strength (try 1e-4 .. 1e-2 if needed)
+lambda_spike = 1e-3
 
 for step in range(1000):
-    (da, ida, vala, wa, sa, series_a), \
-    (db, idb, valb, wb, sb, series_b) = model(noisy, clean)
+    (da, ida, vala, wa, sa, series_a, warmup), \
+    (db, idb, valb, wb, sb, series_b, warmup2) = model(noisy, clean)
 
-    # differentiable series L1 loss + spike-rate regularizer
     loss = series_l1_loss(series_a, series_b) + lambda_spike * (sa.mean() + sb.mean())
 
     opt.zero_grad()
@@ -185,6 +226,7 @@ for step in range(1000):
 
     if step % 20 == 0:
         print(step, float(loss))
+
 
 # ============================================================
 # 6) Visualization utilities
@@ -199,13 +241,15 @@ def plot_spike_rasters_with_winners(time, spikes_a, winner_idx_a, spikes_b, winn
         ax.set_ylabel("Spike strength", color=spike_color)
         ax.tick_params(axis='y', labelcolor=spike_color)
         ax.set_title(title)
-        if ax_idx == 1: ax.set_xlabel("Real time")
+        if ax_idx == 1:
+            ax.set_xlabel("Real time")
         ax.grid(True, alpha=0.3)
+
         ax2 = ax.twinx()
         spike_mask = spikes > threshold
         winner_on_spike = torch.where(spike_mask, winner_idx.float(), torch.nan)
         ax2.scatter(time[spike_mask], winner_on_spike[spike_mask], color=win_color, s=50, alpha=0.8)
-        ax2.set_ylabel("Winning dendrite", color=win_color)
+        ax2.set_ylabel("Winning filter", color=win_color)
         ax2.tick_params(axis='y', labelcolor=win_color)
         ax2.set_ylim(-0.5, winner_idx.max().item() + 1)
     plt.tight_layout()
@@ -213,14 +257,15 @@ def plot_spike_rasters_with_winners(time, spikes_a, winner_idx_a, spikes_b, winn
 
 
 def plot_dendrite_io(time, x, dendritic_outputs):
-    L, K2 = dendritic_outputs.shape
-    fig, axes = plt.subplots(K2, 2, figsize=(10, 2 * K2))
-    for k in range(K2):
+    # dendritic_outputs: [L, K]
+    L, K = dendritic_outputs.shape
+    fig, axes = plt.subplots(K, 2, figsize=(10, 2 * K))
+    for k in range(K):
         axes[k, 0].plot(time, x, color='red')
-        axes[k, 0].set_title(f"D{k} input")
+        axes[k, 0].set_title(f"F{k} input")
 
         axes[k, 1].plot(time, dendritic_outputs[:, k], color='blue')
-        axes[k, 1].set_title(f"D{k} output")
+        axes[k, 1].set_title(f"F{k} output")
 
     plt.tight_layout()
     plt.show()
@@ -233,10 +278,12 @@ def _rising_edges(spikes_1d, thr=0.5, refractory=3):
     s = spikes_1d.detach().cpu()
     above = (s > thr).int()
     rise = torch.where((above[1:] == 1) & (above[:-1] == 0))[0] + 1
-    if rise.numel() == 0: return rise
+    if rise.numel() == 0:
+        return rise
     keep = [int(rise[0].item())]
     for idx in rise[1:].tolist():
-        if idx - keep[-1] >= refractory: keep.append(idx)
+        if idx - keep[-1] >= refractory:
+            keep.append(idx)
     return torch.tensor(keep, dtype=torch.long)
 
 
@@ -253,11 +300,11 @@ def _colored_line(ax, x, y, c, lw=2.0, alpha=1.0):
 
 
 def plot_causal_stack_per_spike(time, x, d2, w, spikes, winner_idx=None, tau=20.0, spike_thr=0.5,
-                                 window_factor=3.0, max_spikes=6, event_refractory=3, show_colorbar=True):
+                                window_factor=3.0, max_spikes=6, event_refractory=3, show_colorbar=True):
     """
     For each spike event (rising edge), plot:
       A) x(t) around spike
-      B) dendrite contributions I_k(t)=w*d2  (ONLY winner + runner-up),
+      B) contributions I_k(t)=w*d2 (ONLY winner + runner-up),
          colored along the curve by causal credit C_k(t)=I_k(t)*exp(-(t_s-t)/tau)
     """
     time_t = time.detach().cpu() if isinstance(time, torch.Tensor) else torch.tensor(time)
@@ -267,11 +314,11 @@ def plot_causal_stack_per_spike(time, x, d2, w, spikes, winner_idx=None, tau=20.
     sp_t   = spikes.detach().cpu()
     win_t  = winner_idx.detach().cpu() if winner_idx is not None else None
 
-    L, K2 = d2_t.shape
+    L, K = d2_t.shape
     tau_f = float(tau)
     win_len = int(window_factor * tau_f)
 
-    I_d = w_t * d2_t  # [L, K2]
+    I_d = w_t * d2_t  # [L, K]
 
     events = _rising_edges(sp_t, thr=spike_thr, refractory=event_refractory)
     if events.numel() == 0:
@@ -280,13 +327,12 @@ def plot_causal_stack_per_spike(time, x, d2, w, spikes, winner_idx=None, tau=20.
     events = events[:max_spikes]
     n = int(events.numel())
 
-    # normalize colors across all selected spikes for comparability
     all_credits = []
     for t_s in events.tolist():
         t0 = max(0, t_s - win_len)
         idx = torch.arange(t0, t_s + 1)
-        decay = torch.exp(-(t_s - idx).float() / tau_f)  # [win]
-        C_all = I_d[idx, :] * decay.unsqueeze(1)         # [win, K2]
+        decay = torch.exp(-(t_s - idx).float() / tau_f)
+        C_all = I_d[idx, :] * decay.unsqueeze(1)
         all_credits.append(C_all)
     C_cat = torch.cat(all_credits, dim=0)
     vmin = float(torch.min(C_cat).item())
@@ -302,33 +348,29 @@ def plot_causal_stack_per_spike(time, x, d2, w, spikes, winner_idx=None, tau=20.
         t0 = max(0, t_s - win_len)
         idx = torch.arange(t0, t_s + 1)
 
-        decay = torch.exp(-(t_s - idx).float() / tau_f)  # [win]
-        C = I_d[idx, :] * decay.unsqueeze(1)             # [win, K2]
+        decay = torch.exp(-(t_s - idx).float() / tau_f)
+        C = I_d[idx, :] * decay.unsqueeze(1)
 
-        # winner at spike time
         k_star = int(win_t[t_s].item()) if win_t is not None else None
 
-        # runner-up by total causal credit in the same window (exclude winner)
-        totals = C.sum(dim=0)  # [K2]
-        if k_star is not None and 0 <= k_star < K2:
+        totals = C.sum(dim=0)
+        if k_star is not None and 0 <= k_star < K:
             totals_ru = totals.clone()
             totals_ru[k_star] = -1e9
             k_ru = int(torch.argmax(totals_ru).item())
         else:
             k_ru = int(torch.argmax(totals).item())
-            k_star = k_ru  # fallback
+            k_star = k_ru
 
-        # --- Track A: Input ---
         axA = fig.add_subplot(gs[2*i + 0, 0])
         axA.plot(time_t[idx], x_t[idx], lw=1.2)
         axA.axvline(time_t[t_s].item(), lw=1.0)
         axA.set_ylabel("x(t)")
         axA.grid(True, alpha=0.25)
         axA.set_title(
-            f"Spike {i+1} | t_idx={t_s} | winner D{k_star} | runner-up D{k_ru} | lookback≈{win_len}≈{window_factor}τ | τ={tau_f:g}"
+            f"Spike {i+1} | t_idx={t_s} | winner F{k_star} | runner-up F{k_ru} | lookback≈{win_len}≈{window_factor}τ | τ={tau_f:g}"
         )
 
-        # --- Track B: Winner + runner-up (colored by credit) ---
         axB = fig.add_subplot(gs[2*i + 1, 0], sharex=axA)
 
         lc1 = _colored_line(axB, time_t[idx], I_d[idx, k_star], C[:, k_star], lw=2.6, alpha=0.95)
@@ -341,8 +383,6 @@ def plot_causal_stack_per_spike(time, x, d2, w, spikes, winner_idx=None, tau=20.
         axB.set_ylabel("I_k(t)")
         axB.grid(True, alpha=0.25)
 
-        # legend omitted: colors encode dendritic credit directly
-
         if first_lc is None:
             first_lc = lc1
 
@@ -353,8 +393,6 @@ def plot_causal_stack_per_spike(time, x, d2, w, spikes, winner_idx=None, tau=20.
         fig.colorbar(first_lc, ax=fig.axes, fraction=0.02, pad=0.01, label="causal credit")
 
     plt.show()
-
-
 
 
 # ============================================================
@@ -370,23 +408,27 @@ if DO_PLOT:
     plt.tight_layout()
     plt.show()
 
-T_window = 20
-L_vis = da.shape[1]
-time = t[0, T_window - 1:T_window - 1 + L_vis].detach().cpu()
+# time axis aligns to the valid region after warmup cropping
+warmup = model.kmax - 1
+L_eff = da.shape[1]
+time = t[0, warmup:warmup + L_eff].detach().cpu()
 
 if DO_PLOT:
-    plot_spike_rasters_with_winners(time,
-                                    sa[0].detach().cpu(), ida[0].detach().cpu(),
-                                    sb[0].detach().cpu(), idb[0].detach().cpu())
+    plot_spike_rasters_with_winners(
+        time,
+        sa[0].detach().cpu(), ida[0].detach().cpu(),
+        sb[0].detach().cpu(), idb[0].detach().cpu()
+    )
 
-    plot_dendrite_io(time,
-                     noisy[0, T_window - 1:T_window - 1 + L_vis].detach().cpu(),
-                     da[0].detach().cpu())
-
+    plot_dendrite_io(
+        time,
+        noisy[0, warmup:warmup + L_eff].detach().cpu(),
+        da[0].detach().cpu()
+    )
 
     plot_causal_stack_per_spike(
         time=time,
-        x=noisy[0, T_window - 1:T_window - 1 + L_vis].detach().cpu(),
+        x=noisy[0, warmup:warmup + L_eff].detach().cpu(),
         d2=da[0].detach().cpu(),
         w=wa[0].detach().cpu(),
         spikes=sa[0].detach().cpu(),

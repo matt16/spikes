@@ -143,68 +143,57 @@ class MultiLIF(nn.Module):
 # ============================================================
 class MinimalFirstSpikeWTA(nn.Module):
     """
-    Minimal WTA after LIF, per SAMPLE:
-      - Hard forward: filter with earliest hard spike wins; all others silenced.
-      - Soft backward: early-evidence score from spikes, softmax + STE.
-
-    Input:
-      spikes: [B, L, K]
-    Output:
-      idx:          [B]
-      w:            [B, K] (STE)
-      spikes_gated: [B, L, K]
+    Global first-spike WTA per SAMPLE:
+      - Forward: pick (t*, k*) = earliest spike over ALL filters; silence others.
+      - Backward: w_sur = softmax(-t_first / T) (relative timing only).
     """
-    def __init__(self, tau_early=20.0, temperature=0.2, thr=0.5, eps=1e-6):
+    def __init__(self, temperature=0.1, thr=0.5):
         super().__init__()
-        self.tau_early = float(tau_early)
         self.temperature = float(temperature)
         self.thr = float(thr)
-        self.eps = float(eps)
-
-    @staticmethod
-    def _first_spike_time(spikes_bool):
-        # spikes_bool: [B, L, K] bool
-        # returns t_first: [B, K] where L means "no spike"
-        B, L, K = spikes_bool.shape
-        any_spk = spikes_bool.any(dim=1)  # [B, K]
-
-        c = spikes_bool.int().cumsum(dim=1)         # [B, L, K]
-        first_mask = (c == 1) & spikes_bool         # [B, L, K]
-        t_first = first_mask.float().argmax(dim=1)  # [B, K] (0 if none)
-        t_first = torch.where(any_spk, t_first, torch.full_like(t_first, L))
-        return t_first
 
     def forward(self, spikes):
+        # spikes: [B, L, K]
         B, L, K = spikes.shape
-        device, dtype = spikes.device, spikes.dtype
+        dtype = spikes.dtype
 
-        # HARD winner: earliest spike
-        spikes_bool = spikes > self.thr
-        t_first = self._first_spike_time(spikes_bool)   # [B, K], L if none
-        idx_hard = torch.argmin(t_first, dim=-1)        # [B]
+        s = spikes > self.thr  # bool [B,L,K]
 
-        # If nobody spikes in a sample: fallback to largest total spikes (often all 0 -> ties -> 0)
-        no_spike = (t_first.min(dim=-1).values >= L)    # [B]
-        total = spikes.sum(dim=1)                       # [B, K]
-        idx_fallback = torch.argmax(total, dim=-1)      # [B]
-        idx = torch.where(no_spike, idx_fallback, idx_hard)
+        # ---- HARD: global first spike (t*, k*) ----
+        any_t = s.any(dim=2)  # [B, L]  True if any filter spiked at time t
+        has_any = any_t.any(dim=1)  # [B]
 
-        w_hard = F.one_hot(idx, K).to(dtype)            # [B, K]
+        # earliest time t* (0 if none -> will be handled)
+        t_star = any_t.float().argmax(dim=1)  # [B]
 
-        # SOFT winner: early-evidence score
-        t = torch.arange(L, device=device, dtype=dtype).view(1, L, 1)
-        decay = torch.exp(-t / max(self.tau_early, self.eps))          # [1, L, 1]
-        r = (spikes * decay).sum(dim=1)                                # [B, K]
+        # at that time pick first filter that spiked
+        s_at_t = s[torch.arange(B, device=spikes.device), t_star, :]  # [B, K]
+        k_star = s_at_t.float().argmax(dim=1)  # [B]  (0 if none)
 
-        w_sur = torch.softmax(r / self.temperature, dim=-1)            # [B, K]
+        # fallback if no spikes at all: pick max total spikes (often ties -> 0)
+        total = spikes.sum(dim=1)  # [B, K]
+        k_fallback = total.argmax(dim=1)
+        idx = torch.where(has_any, k_star, k_fallback)  # [B]
 
-        # STE weights
-        w = w_hard.detach() - w_sur.detach() + w_sur                   # [B, K]
+        w_hard = F.one_hot(idx, K).to(dtype)  # [B,K]
 
-        # Gate spikes (broadcast over time)
-        spikes_gated = spikes * w.unsqueeze(1)                         # [B, L, K]
+        # ---- SOFT (backward): relative timing only ----
+        # t_first per filter is needed for the relative softmax over times:
+        # compute first spike time for each filter (L if none)
+        any_k = s.any(dim=1)  # [B,K]
+        c = s.int().cumsum(dim=1)
+        first_mask = (c == 1) & s
+        t_first = first_mask.float().argmax(dim=1)  # [B,K] (0 if none)
+        t_first = torch.where(any_k, t_first, torch.full_like(t_first, L))  # [B,K]
+
+        r = -t_first.to(dtype)  # earlier => larger
+        w_sur = torch.softmax(r / self.temperature, dim=-1)  # [B,K]
+
+        w = w_hard.detach() - w_sur.detach() + w_sur
+        spikes_gated = spikes * w.unsqueeze(1)  # [B,L,K]
 
         return idx, w, spikes_gated
+
 
 
 # ============================================================

@@ -143,7 +143,7 @@ def evaluate(model, loader, criterion, device):
         n += xb.size(0)
     return total / n
 
-def fit(model, train_loader, test_loader, epochs=20, lr=1e-3, device="cpu", recal_every=3):
+def fit(model, train_loader, test_loader, epochs=500, lr=1e-3, device="cpu", recal_every=3):
     ytr = train_loader.dataset.tensors[1]
     pos = ytr.sum().clamp_min(1.0)
     neg = ytr.numel() - pos
